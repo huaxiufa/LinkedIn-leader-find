@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
 echo ========================================
 echo LinkedIn Lead Finder - Windows Chrome
@@ -23,30 +23,47 @@ if not exist "%PROFILE%" mkdir "%PROFILE%"
 echo [1/3] Chrome found:
 echo %CHROME%
 echo.
-echo [2/3] Starting Chrome with a dedicated Lead Finder profile...
+
+REM If a working CDP endpoint already exists, reuse it.
+powershell -NoProfile -Command "try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:9222/json/version -TimeoutSec 1 | Out-Null; exit 0 } catch { exit 1 }"
+if not errorlevel 1 goto CDPOK
+
+echo [2/3] Preparing dedicated Lead Finder Chrome...
 echo Profile: %PROFILE%
 echo CDP:     http://localhost:9222
 echo.
 echo IMPORTANT:
-echo - Close all normal Chrome windows before running this file.
-echo - A separate Chrome profile will open for Lead Finder.
+echo - This launcher uses a separate Chrome profile for Lead Finder.
 echo - Log in to LinkedIn in that Chrome window.
-echo - Your LinkedIn login state is saved in chrome-profile.
-echo - Keep this Chrome window open while the Lead Finder is working.
+echo - Keep that Chrome window open while the Lead Finder is working.
 echo.
 
-start "LinkedIn Lead Finder Chrome" "%CHROME%" --remote-debugging-address=0.0.0.0 --remote-debugging-port=9222 --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check
+echo Closing existing Chrome processes so the dedicated profile can start cleanly...
+taskkill /F /IM chrome.exe >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+REM Remove only stale Chromium singleton locks from the dedicated profile.
+del /F /Q "%PROFILE%\SingletonLock" >nul 2>&1
+del /F /Q "%PROFILE%\SingletonCookie" >nul 2>&1
+del /F /Q "%PROFILE%\SingletonSocket" >nul 2>&1
+
+start "LinkedIn Lead Finder Chrome" /D "%~dp0" "%CHROME%" --remote-debugging-address=0.0.0.0 --remote-debugging-port=9222 --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check
+
 
 echo Waiting for Chrome CDP...
-for /L %%i in (1,1,20) do (
-  powershell -NoProfile -Command "try { Invoke-WebRequest -UseBasicParsing http://localhost:9222/json/version -TimeoutSec 1 | Out-Null; exit 0 } catch { exit 1 }"
+for /L %%i in (1,1,30) do (
+  powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:9222/json/version -TimeoutSec 1; if($r.StatusCode -eq 200){exit 0}else{exit 1} } catch { exit 1 }"
   if not errorlevel 1 goto CDPOK
   timeout /t 1 /nobreak >nul
 )
 
 echo.
 echo [ERROR] Chrome did not open CDP on port 9222.
-echo Check that no other Chrome process is running, then run this file again.
+echo.
+echo Diagnostic command:
+echo   Invoke-WebRequest http://localhost:9222/json/version
+echo.
+echo If Chrome is visible, keep it open and run the diagnostic command above.
 pause
 exit /b 1
 
