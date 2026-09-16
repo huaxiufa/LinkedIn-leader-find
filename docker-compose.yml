@@ -32,7 +32,7 @@ services:
       - "9222:9222"
     volumes:
       - linkedin_profile:/data/linkedin-profile
-    command: sh ./worker/browser-entrypoint.sh
+    command: sh -c "sed -i 's/\\r$//' worker/browser-entrypoint.sh && exec sh worker/browser-entrypoint.sh"
 
   app:
     build:
