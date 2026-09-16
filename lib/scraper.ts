@@ -33,9 +33,6 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   const configuredUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
   const configured = new URL(configuredUrl);
 
-  // Chrome rejects a Host header such as "host.docker.internal" for its
-  // DevTools HTTP endpoint. Resolve the Docker host gateway to an IP first,
-  // then make the request using that IP as both URL host and Host header.
   let cdpHost = configured.hostname;
   if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(cdpHost) && cdpHost !== "localhost") {
     const addresses = await lookup(cdpHost, { all: true });
@@ -71,7 +68,10 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   const browser = await chromium.connectOverCDP(wsUrl);
   const context = browser.contexts()[0];
   if (!context) throw new Error("Chrome CDP is connected, but no browser context is available.");
-  const page = context.pages()[0] ?? await context.newPage();
+
+  // Always create a new tab. Never navigate the user's currently active tab.
+  const page = await context.newPage();
+  console.log("Created dedicated LinkedIn scraping tab; existing Chrome tabs remain untouched.");
   return { browser, context, page };
 }
 
@@ -148,7 +148,7 @@ export async function scrapePublicPost(
   const warnings: string[] = [];
   const engagements: ScrapedEngagement[] = [];
 
-  const { browser, context, page } = await connectToLinkedInBrowser();
+  const { context, page } = await connectToLinkedInBrowser();
 
   try {
     await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -233,6 +233,7 @@ export async function scrapePublicPost(
 
     return { engagements: [...deduped.values()], warnings };
   } finally {
-    // Do not close the user's Windows Chrome. The CDP connection is shared with it.
+    // Close only the temporary scraping tab. Never close the user's Chrome.
+    await page.close().catch(() => {});
   }
 }
