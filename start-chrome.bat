@@ -84,5 +84,5 @@ echo - LinkedIn login state is checked by the worker when a search starts.
 echo.
 echo Next step:
 echo   docker compose up --build
- echo.
+echo.
 pause
