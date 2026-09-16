@@ -1,46 +1,64 @@
 # LinkedIn Lead Finder
 
-A minimal local MVP: enter a LinkedIn post URL, collect commenters/reactions visible to your own logged-in Windows Chrome session, deduplicate people, filter by job-title keywords, and export a CSV.
+A minimal local MVP: enter one or more LinkedIn post URLs, collect commenters/reactions visible to your own Windows Chrome session, deduplicate people, filter by job-title keywords, and export a CSV.
 
 ## Run with Docker on Windows
 
 Install only Docker Desktop. You do **not** need Node.js, npm, npx, Prisma, or Playwright installed on Windows.
 
-This version does **not** create a Chromium browser inside Docker. It connects to the Chrome you already use on Windows through Chrome DevTools Protocol (CDP).
+This version connects to the Chrome you run on Windows through Chrome DevTools Protocol (CDP). The Lead Finder Chrome uses a dedicated persistent profile at `chrome-profile` inside this project folder.
 
 ```powershell
 git clone https://github.com/huaxiufa/LinkedIn-leader-find.git
 cd LinkedIn-leader-find
+```
+
+## Start the persistent Lead Finder Chrome
+
+Use the included `start-chrome.bat`.
+
+The launcher uses:
+
+```text
+<project-folder>\chrome-profile
+```
+
+This is a dedicated Chrome user-data directory. Chrome stores profile state such as cookies and other local session data in its user-data directory, so reusing the same directory lets the Lead Finder reuse the browser session across application restarts. citeturn0search0turn0search4
+
+First run:
+
+1. Run `start-chrome.bat`.
+2. A dedicated Lead Finder Chrome window opens.
+3. Open LinkedIn and log in normally.
+4. Keep that Chrome window open.
+5. Run Docker:
+
+```powershell
 docker compose up --build
 ```
 
-## Start Windows Chrome with CDP
+Later runs:
 
-Close all normal Chrome windows first, then start Chrome with remote debugging enabled.
+1. Run `start-chrome.bat` again.
+2. The same `chrome-profile` directory is reused.
+3. If the LinkedIn session is still valid, you normally do not need to log in again.
+4. Run `docker compose up --build`.
 
-Typical Chrome path:
+**Do not delete `chrome-profile`** if you want to keep the saved browser session. If LinkedIn itself expires or invalidates the session, you will need to log in again normally.
 
-```powershell
-& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
-```
+The launcher no longer force-closes all Chrome processes. It only reuses the dedicated Lead Finder Chrome when CDP is already available.
 
-If Chrome is installed under x86 Program Files, use:
+## LinkedIn login status detection
 
-```powershell
-& "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
-```
+The worker checks the connected LinkedIn page for the normal signed-out indicators exposed by the UI.
 
-You can also use your existing Chrome shortcut by adding `--remote-debugging-port=9222` to its target.
+The results page shows:
 
-Then:
+- `LinkedIn session: SIGNED IN`
+- `LinkedIn session: SIGNED OUT`
+- `LinkedIn session: UNKNOWN`
 
-1. In that Chrome window, open LinkedIn.
-2. Log into LinkedIn normally if needed.
-3. Leave Chrome open.
-4. Open `http://localhost:3000`.
-5. Enter the LinkedIn post URL and run the search.
-
-The Docker worker connects to `http://host.docker.internal:9222` and controls the already-running Windows Chrome. It does not launch or close Chrome.
+If it detects `SIGNED OUT`, log into LinkedIn in the dedicated Lead Finder Chrome window and run the search again.
 
 ## Verify CDP before running a search
 
@@ -58,15 +76,16 @@ If CDP is enabled, Chrome returns JSON containing a `webSocketDebuggerUrl` field
 - `worker`: scraping worker connected to Windows Chrome via CDP
 - `postgres`: PostgreSQL database on port 5432
 
-There is no Docker Chromium, VNC/noVNC service, or persisted Chromium profile in this version.
+There is no Docker Chromium, VNC/noVNC service, or separate browser login inside Docker.
 
 ## Scraping behavior
 
-- Uses the user's own normal Windows Chrome LinkedIn login session.
+- Uses the user's own Windows Chrome LinkedIn login session.
 - Reads engagement data exposed to that account in the LinkedIn UI.
 - Scrolls the reaction-user panel to load more visible users.
+- Can use normal profile clicks as a fallback to capture a profile URL and then return/close the profile page.
 - Deduplicates people by normalized LinkedIn profile URL.
-- Enriches visible profiles with headline/job-title information.
+- Gives comments priority over reactions for the same person.
 - Applies include/exclude title keyword filters.
 - Exports results as CSV.
 
@@ -80,11 +99,15 @@ The scraper does not bypass CAPTCHA, anti-bot systems, rate limits, or access co
 docker compose down
 ```
 
+You can close the dedicated Lead Finder Chrome separately when you are finished. The `chrome-profile` directory remains on disk so the session can be reused next time.
+
 ## Scope
 
 - LinkedIn post URL input
 - Logged-in-session comments/reactions visible in the UI
 - Profile deduplication
 - Include/exclude title keywords
+- Persistent dedicated Chrome session
+- LinkedIn session status detection
 - CSV export
 - No Apify, AI, CRM, outreach, billing, or team features
