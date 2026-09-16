@@ -25,15 +25,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   }));
 
   const uniquePeople = new Set(search.engagements.map((e) => e.profileId)).size;
-  const matchedPeople = new Set(
-    search.engagements.map((e) => e.profileId)
-  ).size;
+  const matchedPeople = new Set(search.engagements.map((e) => e.profileId)).size;
 
   return NextResponse.json({
     id: search.id,
     postUrl: search.postUrl,
     postUrls: search.postUrls.length ? search.postUrls : [search.postUrl],
     status: search.status,
+    sessionStatus: search.sessionStatus,
     error: search.error,
     includeKeywords: search.includeKeywords,
     excludeKeywords: search.excludeKeywords,
