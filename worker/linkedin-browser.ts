@@ -11,6 +11,9 @@ async function main() {
     headless: false,
     viewport: { width: 1440, height: 1000 },
     locale: "en-US",
+    // Playwright normally uses a private remote-debugging pipe. Remove that
+    // default so Chromium exposes the TCP CDP endpoint used by the scraper.
+    ignoreDefaultArgs: ["--remote-debugging-pipe"],
     args: [
       `--display=${display}`,
       `--remote-debugging-port=${cdpPort}`,
@@ -23,6 +26,7 @@ async function main() {
   const page = browser.pages()[0] ?? await browser.newPage();
   await page.goto("https://www.linkedin.com/", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
   console.log("LinkedIn browser is ready.");
+  console.log(`CDP endpoint: http://0.0.0.0:${cdpPort}`);
   console.log("Open http://localhost:7900/vnc.html in your browser to control it.");
   console.log("Log into LinkedIn normally. The browser profile is persisted in /data/linkedin-profile.");
 
