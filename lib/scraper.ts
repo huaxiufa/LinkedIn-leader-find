@@ -31,7 +31,29 @@ function inferJobTitle(headline?: string) {
 async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
   const cdpUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
   console.log(`Connecting to existing Chrome via CDP: ${cdpUrl}`);
-  const browser = await chromium.connectOverCDP(cdpUrl);
+
+  // The /json/version endpoint may return a websocket URL containing
+  // localhost/127.0.0.1. That address is valid on Windows but not inside
+  // the Docker container, so rewrite it to the configured CDP host.
+  const versionUrl = `${cdpUrl.replace(/\/$/, "")}/json/version`;
+  const response = await fetch(versionUrl);
+  if (!response.ok) {
+    throw new Error(`Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}`);
+  }
+
+  const version = (await response.json()) as { webSocketDebuggerUrl?: string };
+  if (!version.webSocketDebuggerUrl) {
+    throw new Error("Chrome CDP /json/version did not provide webSocketDebuggerUrl.");
+  }
+
+  const cdpHost = new URL(cdpUrl).hostname;
+  const wsUrl = version.webSocketDebuggerUrl.replace(
+    /^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i,
+    `ws://${cdpHost}`
+  );
+
+  console.log(`Connecting to Chrome CDP websocket: ${wsUrl}`);
+  const browser = await chromium.connectOverCDP(wsUrl);
   const context = browser.contexts()[0];
   if (!context) throw new Error("Chrome CDP is connected, but no browser context is available.");
   const page = context.pages()[0] ?? await context.newPage();
