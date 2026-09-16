@@ -30,15 +30,27 @@ function inferJobTitle(headline?: string) {
 
 async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
   const cdpUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
-  console.log(`Connecting to existing Chrome via CDP: ${cdpUrl}`);
+  const baseUrl = cdpUrl.replace(/\/$/, "");
+  const versionUrl = `${baseUrl}/json/version`;
+  console.log(`Connecting to existing Chrome via CDP: ${baseUrl}`);
 
-  // The /json/version endpoint may return a websocket URL containing
-  // localhost/127.0.0.1. That address is valid on Windows but not inside
-  // the Docker container, so rewrite it to the configured CDP host.
-  const versionUrl = `${cdpUrl.replace(/\/$/, "")}/json/version`;
-  const response = await fetch(versionUrl);
+  // Chrome's DevTools HTTP server can reject requests whose Host header is
+  // not the local host name. Docker reaches Windows through host.docker.internal,
+  // so explicitly use the same Host value Chrome sees for local requests.
+  let response: Response;
+  try {
+    response = await fetch(versionUrl, {
+      headers: { Host: "localhost:9222" },
+    });
+  } catch (error) {
+    throw new Error(`Cannot reach Chrome CDP at ${versionUrl}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   if (!response.ok) {
-    throw new Error(`Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}`);
+    const body = await response.text().catch(() => "");
+    throw new Error(
+      `Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}${body ? `: ${body.slice(0, 300)}` : ""}`
+    );
   }
 
   const version = (await response.json()) as { webSocketDebuggerUrl?: string };
@@ -47,10 +59,9 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   }
 
   const cdpHost = new URL(cdpUrl).hostname;
-  const wsUrl = version.webSocketDebuggerUrl.replace(
-    /^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i,
-    `ws://${cdpHost}`
-  );
+  const wsUrl = version.webSocketDebuggerUrl
+    .replace(/^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i, `ws://${cdpHost}`)
+    .replace(/^ws:\/\/localhost(?=:|\/)/i, `ws://${cdpHost}`);
 
   console.log(`Connecting to Chrome CDP websocket: ${wsUrl}`);
   const browser = await chromium.connectOverCDP(wsUrl);
