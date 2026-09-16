@@ -11,6 +11,56 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d linkedin_leads"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-lead-finder-app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/linkedin_leads?schema=public
+      SCRAPER_POLL_MS: "3000"
+      SCRAPER_HEADLESS: "true"
+      SCRAPER_MAX_COMMENTS: "500"
+      SCRAPER_MAX_REACTIONS: "500"
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - app_node_modules:/app/node_modules
+      - app_next:/app/.next
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: sh -c "npx prisma generate && npx prisma db push && npm run dev"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-lead-finder-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/linkedin_leads?schema=public
+      SCRAPER_POLL_MS: "3000"
+      SCRAPER_HEADLESS: "true"
+      SCRAPER_MAX_COMMENTS: "500"
+      SCRAPER_MAX_REACTIONS: "500"
+    volumes:
+      - .:/app
+      - worker_node_modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: sh -c "npx prisma generate && npm run worker"
 
 volumes:
   postgres_data:
+  app_node_modules:
+  app_next:
