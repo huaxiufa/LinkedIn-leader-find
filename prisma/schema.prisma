@@ -22,8 +22,11 @@ enum EngagementType {
 model Search {
   id               String       @id @default(cuid())
   postUrl          String
+  postUrls         String[]     @default([])
   includeKeywords  String[]     @default([])
   excludeKeywords  String[]     @default([])
+  suppressionUrls  String[]     @default([])
+  maxEngagersPerPost Int        @default(500)
   status           SearchStatus @default(QUEUED)
   error            String?
   createdAt        DateTime     @default(now())
@@ -52,6 +55,7 @@ model Engagement {
   searchId     String
   profileId    String
   type         EngagementType
+  postUrl      String?
   reactionType String?
   commentText  String?
   engagedAt    DateTime?
