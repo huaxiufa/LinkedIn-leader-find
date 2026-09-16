@@ -35,10 +35,10 @@ echo - Your LinkedIn login state is saved in chrome-profile.
 echo - Keep this Chrome window open while the Lead Finder is working.
 echo.
 
-start "LinkedIn Lead Finder Chrome" "%CHROME%" --remote-debugging-port=9222 --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check
+start "LinkedIn Lead Finder Chrome" "%CHROME%" --remote-debugging-address=0.0.0.0 --remote-debugging-port=9222 --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check
 
 echo Waiting for Chrome CDP...
-for /L %%i in (1,1,15) do (
+for /L %%i in (1,1,20) do (
   powershell -NoProfile -Command "try { Invoke-WebRequest -UseBasicParsing http://localhost:9222/json/version -TimeoutSec 1 | Out-Null; exit 0 } catch { exit 1 }"
   if not errorlevel 1 goto CDPOK
   timeout /t 1 /nobreak >nul
