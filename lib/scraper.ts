@@ -23,12 +23,6 @@ function clean(s: string | undefined | null) {
   return (s ?? "").replace(/\s+/g, " ").trim();
 }
 
-function inferJobTitle(headline?: string) {
-  const h = clean(headline);
-  if (!h) return undefined;
-  return h;
-}
-
 async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
   const configuredUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
   const configured = new URL(configuredUrl);
@@ -44,20 +38,14 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   const versionUrl = `http://${cdpHost}:${configured.port || "9222"}/json/version`;
   console.log(`Connecting to existing Chrome CDP via ${versionUrl}`);
 
-  const response = await fetch(versionUrl, {
-    headers: { Host: cdpHost },
-  });
+  const response = await fetch(versionUrl, { headers: { Host: cdpHost } });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new Error(
-      `Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}${detail ? `: ${clean(detail)}` : ""}`
-    );
+    throw new Error(`Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}${detail ? `: ${clean(detail)}` : ""}`);
   }
 
   const version = (await response.json()) as { webSocketDebuggerUrl?: string };
-  if (!version.webSocketDebuggerUrl) {
-    throw new Error("Chrome CDP /json/version did not provide webSocketDebuggerUrl.");
-  }
+  if (!version.webSocketDebuggerUrl) throw new Error("Chrome CDP /json/version did not provide webSocketDebuggerUrl.");
 
   const wsUrl = version.webSocketDebuggerUrl.replace(
     /^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i,
@@ -69,7 +57,6 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   const context = browser.contexts()[0];
   if (!context) throw new Error("Chrome CDP is connected, but no browser context is available.");
 
-  // Always create a new tab. Never navigate the user's currently active tab.
   const page = await context.newPage();
   console.log("Created dedicated LinkedIn scraping tab; existing Chrome tabs remain untouched.");
   return { browser, context, page };
@@ -115,31 +102,6 @@ async function collectReactionLinks(page: Page, max: number) {
   return results;
 }
 
-async function readProfileSummary(context: BrowserContext, url: string) {
-  const page = await context.newPage();
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(700);
-
-    const name = clean(await page.locator("h1").first().textContent().catch(() => ""));
-    const headline = clean(
-      await page
-        .locator("main .text-body-medium, main [class*='headline']")
-        .first()
-        .textContent()
-        .catch(() => "")
-    );
-
-    return {
-      name: name || "Unknown",
-      headline: headline || undefined,
-      jobTitle: inferJobTitle(headline),
-    };
-  } finally {
-    await page.close().catch(() => {});
-  }
-}
-
 export async function scrapePublicPost(
   postUrl: string,
   options: { maxComments?: number; maxReactions?: number } = {}
@@ -148,7 +110,7 @@ export async function scrapePublicPost(
   const warnings: string[] = [];
   const engagements: ScrapedEngagement[] = [];
 
-  const { context, page } = await connectToLinkedInBrowser();
+  const { page } = await connectToLinkedInBrowser();
 
   try {
     await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -160,6 +122,8 @@ export async function scrapePublicPost(
       warnings.push("The connected Windows Chrome session appears to be signed out of LinkedIn. Log into LinkedIn in that Chrome window and retry.");
     }
 
+    // Get the commenter's public profile URL directly from the post page.
+    // Never open the customer's profile page.
     const commentBlocks = page.locator('[data-test-id*="comment"], article, [class*="comment"]');
     const count = Math.min(await commentBlocks.count().catch(() => 0), maxComments);
 
@@ -179,6 +143,8 @@ export async function scrapePublicPost(
       engagements.push({ profileUrl, name, type: "COMMENT", commentText: text.slice(0, 5000) });
     }
 
+    // Get reaction users' public profile URLs directly from the reaction panel.
+    // Never navigate to any customer's profile URL.
     const reactionDialogTriggers = page.getByRole("button", {
       name: /people who reacted|reactions|reaction(s)?\s*\d+/i,
     });
@@ -205,26 +171,8 @@ export async function scrapePublicPost(
       warnings.push("A reaction-user list trigger was not exposed by the page.");
     }
 
-    const uniqueUrls = [...new Set(engagements.map((x) => x.profileUrl))].slice(0, 200);
-    const profiles = new Map<string, { name: string; headline?: string; jobTitle?: string }>();
-
-    for (const url of uniqueUrls) {
-      try {
-        profiles.set(url, await readProfileSummary(context, url));
-      } catch {
-        // Keep data already collected from the post.
-      }
-    }
-
-    for (const item of engagements) {
-      const p = profiles.get(item.profileUrl);
-      if (p) {
-        item.name = p.name !== "Unknown" ? p.name : item.name;
-        item.headline = p.headline;
-        item.jobTitle = p.jobTitle;
-      }
-    }
-
+    // Profile URLs and visible names/headlines are taken only from the post page.
+    // Do not open profile pages for enrichment.
     const deduped = new Map<string, ScrapedEngagement>();
     for (const item of engagements) {
       const key = `${item.profileUrl}|${item.type}`;
@@ -233,7 +181,6 @@ export async function scrapePublicPost(
 
     return { engagements: [...deduped.values()], warnings };
   } finally {
-    // Close only the temporary scraping tab. Never close the user's Chrome.
     await page.close().catch(() => {});
   }
 }
