@@ -28,23 +28,44 @@ function inferJobTitle(headline?: string) {
   return h;
 }
 
-async function collectCommentLinks(page: Page, max: number) {
-  const links = await page.locator('a[href*="/in/"]').evaluateAll((els) =>
-    els.map((e) => ({
-      href: (e as HTMLAnchorElement).href,
-      text: (e.textContent ?? "").trim(),
-    }))
-  );
-
+async function collectReactionLinks(page: Page, max: number) {
   const seen = new Set<string>();
-  return links
-    .map((x) => ({ ...x, href: normalizeLinkedInUrl(x.href) }))
-    .filter((x) => {
-      if (!x.href.includes("linkedin.com/in/") || seen.has(x.href)) return false;
-      seen.add(x.href);
-      return true;
-    })
-    .slice(0, max);
+  const results: { href: string; text: string }[] = [];
+
+  for (let round = 0; round < 8 && results.length < max; round++) {
+    const links = await page.locator('a[href*="/in/"]').evaluateAll((els) =>
+      els.map((e) => ({
+        href: (e as HTMLAnchorElement).href,
+        text: (e.textContent ?? "").trim(),
+      }))
+    );
+
+    for (const item of links) {
+      const href = normalizeLinkedInUrl(item.href);
+      if (!href.includes("linkedin.com/in/") || seen.has(href)) continue;
+      seen.add(href);
+      results.push({ href, text: clean(item.text) });
+      if (results.length >= max) break;
+    }
+
+    if (results.length >= max) break;
+
+    const scrolled = await page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+        '[role="dialog"] [class*="artdeco-modal__content"], [role="dialog"] [class*="overflow-y-auto"], [role="dialog"]'
+      ));
+      const target = candidates.find((el) => el.scrollHeight > el.clientHeight);
+      if (!target) return false;
+      const before = target.scrollTop;
+      target.scrollTop = Math.min(target.scrollTop + target.clientHeight * 0.85, target.scrollHeight);
+      return target.scrollTop > before;
+    }).catch(() => false);
+
+    if (!scrolled) break;
+    await page.waitForTimeout(500);
+  }
+
+  return results;
 }
 
 async function readProfileSummary(page: Page, url: string) {
@@ -121,15 +142,32 @@ export async function scrapePublicPost(
       });
     }
 
-    const reactionButtons = page.getByRole("button", {
-      name: /reaction|like|people who reacted|reactions/i,
+    // Do NOT match the normal Like button here. The previous selector could
+    // click the post's Like action instead of opening the reaction-user list.
+    const reactionDialogTriggers = page.getByRole("button", {
+      name: /people who reacted|reactions|reaction(s)?\s*\d+/i,
     });
 
-    if (await reactionButtons.count().catch(() => 0)) {
-      await reactionButtons.first().click().catch(() => {});
-      await page.waitForTimeout(700);
+    let reactionTriggerCount = await reactionDialogTriggers.count().catch(() => 0);
 
-      const reactionLinks = await collectCommentLinks(page, options.maxReactions ?? 500);
+    if (!reactionTriggerCount) {
+      // LinkedIn sometimes renders the reaction count as a link/span rather
+      // than a button. Look for accessible text without targeting the Like action.
+      const candidates = page.locator(
+        '[aria-label*="reaction" i], [aria-label*="people who reacted" i], [data-test-id*="reaction" i]'
+      );
+      reactionTriggerCount = await candidates.count().catch(() => 0);
+      if (reactionTriggerCount) {
+        await candidates.first().click().catch(() => {});
+      }
+    } else {
+      await reactionDialogTriggers.first().click().catch(() => {});
+    }
+
+    if (reactionTriggerCount) {
+      await page.waitForTimeout(1000);
+
+      const reactionLinks = await collectReactionLinks(page, options.maxReactions ?? 500);
       for (const link of reactionLinks) {
         engagements.push({
           profileUrl: link.href,
@@ -137,6 +175,12 @@ export async function scrapePublicPost(
           type: "REACTION",
           reactionType: "UNKNOWN",
         });
+      }
+
+      if (!reactionLinks.length) {
+        warnings.push(
+          "The reaction panel opened, but no public /in/ profile links were exposed in it. LinkedIn may be limiting the visible reaction users."
+        );
       }
     } else {
       warnings.push(
