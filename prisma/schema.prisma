@@ -1,0 +1,66 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SearchStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum EngagementType {
+  COMMENT
+  REACTION
+}
+
+model Search {
+  id               String       @id @default(cuid())
+  postUrl          String
+  includeKeywords  String[]     @default([])
+  excludeKeywords  String[]     @default([])
+  status           SearchStatus @default(QUEUED)
+  error            String?
+  createdAt        DateTime     @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+  engagements      Engagement[]
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Profile {
+  id          String       @id @default(cuid())
+  linkedinUrl String       @unique
+  name        String
+  headline    String?
+  jobTitle    String?
+  company     String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  engagements Engagement[]
+}
+
+model Engagement {
+  id           String         @id @default(cuid())
+  searchId     String
+  profileId    String
+  type         EngagementType
+  reactionType String?
+  commentText  String?
+  engagedAt    DateTime?
+  createdAt    DateTime       @default(now())
+
+  search  Search  @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  profile Profile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([searchId, profileId, type])
+  @@index([searchId])
+  @@index([profileId])
+}
