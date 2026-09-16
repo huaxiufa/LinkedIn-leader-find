@@ -46,7 +46,6 @@ function extractPerson(container: Element, fallbackHref = "") {
   const anchor = links[0];
   const href = normalizeLinkedInUrl(anchor?.href || anchor?.getAttribute("data-test-profile-url") || anchor?.getAttribute("data-profile-url") || fallbackHref);
   if (!href.includes("linkedin.com/in/")) return null;
-
   const lines = (container.textContent ?? "").split(/\n+/).map(clean).filter(Boolean);
   const name = firstNonEmpty(anchor?.textContent, anchor?.getAttribute("aria-label"), lines[0]);
   if (!name) return null;
@@ -90,22 +89,30 @@ async function collectReactionPeople(page: Page, max: number) {
       const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
       const candidates = dialogs.flatMap(d => [d, ...Array.from(d.querySelectorAll<HTMLElement>('div, ul, ol'))]);
       const target = candidates.filter(el => el.scrollHeight > el.clientHeight + 20).sort((a,b) => b.scrollHeight - a.scrollHeight)[0];
-      if (!target) return { scrolled: false, dialogText: dialogs.map(d => d.innerText).join("\n").slice(0, 3000), anchors: document.querySelectorAll('[role="dialog"] a').length };
+      const dialogText = dialogs.map(d => d.innerText).join("\n").slice(0, 3000);
+      const anchors = document.querySelectorAll('[role="dialog"] a').length;
+      if (!target) return { scrolled: false, dialogText, anchors };
       const before = target.scrollTop;
       target.scrollTop = Math.min(target.scrollTop + Math.max(300, target.clientHeight * 0.9), target.scrollHeight);
-      return { scrolled: target.scrollTop > before, dialogText: dialogs.map(d => d.innerText).join("\n").slice(0, 3000), anchors: document.querySelectorAll('[role="dialog"] a').length };
+      return { scrolled: target.scrollTop > before, dialogText, anchors };
     }).catch(() => ({ scrolled: false, dialogText: "", anchors: 0 }));
 
     if (!scrollResult.scrolled) {
       if (!results.length) {
         const diagnostics = await page.evaluate(() => {
-          const dialog = document.querySelector('[role="dialog"]');
+          const compact = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+          const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+          const allDialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
+          const hrefs = dialog ? Array.from(dialog.querySelectorAll<HTMLAnchorElement>('a[href]')).slice(0, 30).map(a => ({ href: a.href, text: compact(a.textContent), aria: a.getAttribute("aria-label") })) : [];
+          const profileLikeAttrs = dialog ? Array.from(dialog.querySelectorAll<HTMLElement>('*')).flatMap(el => Array.from(el.attributes).filter(a => /href|profile|urn|entity|member/i.test(a.name)).map(a => ({ name: a.name, value: a.value.slice(0, 300) }))).slice(0, 80) : [];
           return {
-            dialogCount: document.querySelectorAll('[role="dialog"]').length,
-            links: dialog ? Array.from(dialog.querySelectorAll<HTMLAnchorElement>('a')).slice(0, 20).map(a => ({ href: a.href, text: clean(a.textContent), aria: a.getAttribute("aria-label"), cls: a.className })) : [],
-            text: dialog ? clean(dialog.textContent).slice(0, 2500) : ""
+            dialogCount: allDialogs.length,
+            dialogText: compact(dialog?.innerText).slice(0, 3000),
+            hrefs,
+            profileLikeAttrs,
+            bodyHasInLinks: document.querySelectorAll('a[href*="/in/"]').length
           };
-        }).catch(() => null);
+        }).catch((error) => ({ error: String(error) }));
         console.log("Reaction dialog diagnostics:", JSON.stringify(diagnostics));
       }
       break;
