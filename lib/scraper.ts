@@ -29,10 +29,11 @@ function inferJobTitle(headline?: string) {
 }
 
 async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
-  const cdpUrl = process.env.LINKEDIN_CDP_URL ?? "http://browser:9222";
+  const cdpUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
+  console.log(`Connecting to existing Chrome via CDP: ${cdpUrl}`);
   const browser = await chromium.connectOverCDP(cdpUrl);
   const context = browser.contexts()[0];
-  if (!context) throw new Error("LinkedIn browser context is not available.");
+  if (!context) throw new Error("Chrome CDP is connected, but no browser context is available.");
   const page = context.pages()[0] ?? await context.newPage();
   return { browser, context, page };
 }
@@ -119,7 +120,7 @@ export async function scrapePublicPost(
     const bodyText = clean(await page.locator("body").textContent().catch(() => ""));
     const signedIn = !/sign in|join linkedin|log in/i.test(bodyText);
     if (!signedIn) {
-      warnings.push("LinkedIn is showing a sign-in gate. Open the browser session and log into LinkedIn normally first.");
+      warnings.push("The connected Windows Chrome session appears to be signed out of LinkedIn. Log into LinkedIn in that Chrome window and retry.");
     }
 
     const commentBlocks = page.locator('[data-test-id*="comment"], article, [class*="comment"]');
@@ -161,7 +162,7 @@ export async function scrapePublicPost(
         engagements.push({ profileUrl: link.href, name: link.text || "Unknown", type: "REACTION", reactionType: "UNKNOWN" });
       }
       if (!reactionLinks.length) {
-        warnings.push("The reaction panel opened, but no public /in/ profile links were exposed. Check the logged-in browser session and whether LinkedIn exposes the reaction list to this account.");
+        warnings.push("The reaction panel opened, but no public /in/ profile links were exposed. Check the logged-in Chrome session and whether LinkedIn exposes the reaction list to this account.");
       }
     } else {
       warnings.push("A reaction-user list trigger was not exposed by the page.");
@@ -195,7 +196,6 @@ export async function scrapePublicPost(
 
     return { engagements: [...deduped.values()], warnings };
   } finally {
-    // The browser is a persistent shared session managed by the browser container.
-    // Do not close it from the scraper worker.
+    // Do not close the user's Windows Chrome. The CDP connection is shared with it.
   }
 }
