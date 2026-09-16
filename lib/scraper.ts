@@ -58,7 +58,6 @@ async function collectReactionPeople(page: Page, max: number) {
   const seen = new Set<string>();
   const results: Array<{ profileUrl: string; name: string; headline?: string }> = [];
 
-  // First use normal profile links already exposed in the reaction surface.
   for (let round = 0; round < 50 && results.length < max; round++) {
     const cards = page.locator('[role="dialog"] li, [role="dialog"] [role="listitem"], [role="dialog"] [data-view-name], [role="dialog"] .mn-pymk-list__card, [role="dialog"] div');
     const count = await cards.count().catch(() => 0);
@@ -103,9 +102,6 @@ async function collectReactionPeople(page: Page, max: number) {
     if (!discoveredThisRound && round > 5) break;
   }
 
-  // Some LinkedIn reaction lists render the person as a clickable UI element without
-  // putting the profile URL in href. In that case, open the person normally, capture
-  // the resulting LinkedIn URL, then immediately return/close it. No bypass is used.
   if (results.length < max) {
     const opened = await collectReactionPeopleByOpening(page, max - results.length, seen);
     results.push(...opened);
@@ -170,8 +166,6 @@ async function collectReactionPeopleByOpening(page: Page, max: number, seen: Set
       await page.waitForTimeout(500);
     }
 
-    // If clicking opened a profile modal but did not change the URL, close only that
-    // modal and continue from the reaction list.
     const closeButton = page.getByRole("button", { name: /close/i }).last();
     if (await closeButton.count().catch(() => 0)) {
       await closeButton.click({ timeout: 1000 }).catch(() => {});
@@ -182,37 +176,34 @@ async function collectReactionPeopleByOpening(page: Page, max: number, seen: Set
 }
 
 async function inspectReactionSurface(page: Page) {
-  return page.evaluate(() => {
-    const compact = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
-    const surfaces = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]'));
-    const surface = surfaces[0];
-    const links = surface ? Array.from(surface.querySelectorAll<HTMLAnchorElement>('a')).slice(0, 50).map(a => ({
-      href: a.href,
-      text: compact(a.textContent),
-      aria: a.getAttribute("aria-label"),
-      title: a.getAttribute("title")
-    })) : [];
-    const buttons = surface ? Array.from(surface.querySelectorAll<HTMLButtonElement>('button')).slice(0, 50).map(b => ({
-      text: compact(b.textContent),
-      aria: b.getAttribute("aria-label"),
-      title: b.getAttribute("title"),
-      dataView: b.getAttribute("data-view-name")
-    })) : [];
-    const candidateAttributes = surface ? Array.from(surface.querySelectorAll<HTMLElement>('*')).flatMap(el => Array.from(el.attributes)
-      .filter(a => /href|profile|member|entity|urn|actor|user|person/i.test(a.name) || /linkedin\.com\/in\//i.test(a.value))
-      .map(a => ({ name: a.name, value: a.value.slice(0, 500) }))).slice(0, 120) : [];
-    const text = compact(surface?.innerText).slice(0, 5000);
+  const script = `(function () {
+    function compact(value) { return (value || "").replace(/\\s+/g, " ").trim(); }
+    var surfaces = Array.from(document.querySelectorAll('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]'));
+    var surface = surfaces[0];
+    var links = surface ? Array.from(surface.querySelectorAll('a')).slice(0, 50).map(function (a) {
+      return { href: a.href, text: compact(a.textContent), aria: a.getAttribute('aria-label'), title: a.getAttribute('title') };
+    }) : [];
+    var buttons = surface ? Array.from(surface.querySelectorAll('button')).slice(0, 50).map(function (b) {
+      return { text: compact(b.textContent), aria: b.getAttribute('aria-label'), title: b.getAttribute('title'), dataView: b.getAttribute('data-view-name') };
+    }) : [];
+    var candidateAttributes = surface ? Array.from(surface.querySelectorAll('*')).flatMap(function (el) {
+      return Array.from(el.attributes).filter(function (a) {
+        return /href|profile|member|entity|urn|actor|user|person/i.test(a.name) || /linkedin\\.com\\/in\\//i.test(a.value);
+      }).map(function (a) { return { name: a.name, value: a.value.slice(0, 500) }; });
+    }).slice(0, 120) : [];
+    var text = compact(surface ? surface.innerText : '').slice(0, 5000);
     return {
       surfaceCount: surfaces.length,
-      surfaceTag: surface?.tagName ?? "",
-      surfaceClass: surface?.className ?? "",
-      text,
-      links,
-      buttons,
-      candidateAttributes,
+      surfaceTag: surface ? surface.tagName : '',
+      surfaceClass: surface ? String(surface.className || '') : '',
+      text: text,
+      links: links,
+      buttons: buttons,
+      candidateAttributes: candidateAttributes,
       bodyProfileLinks: document.querySelectorAll('a[href*="/in/"]').length
     };
-  }).catch(error => ({ error: String(error) }));
+  })()`;
+  return page.evaluate(script).catch(error => ({ error: String(error) }));
 }
 
 export async function scrapePublicPost(postUrl: string, options: { maxComments?: number; maxReactions?: number } = {}): Promise<ScrapeResult> {
