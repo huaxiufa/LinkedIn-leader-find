@@ -23,6 +23,7 @@ type Search = {
   postUrl: string;
   postUrls: string[];
   status: string;
+  sessionStatus: string;
   error: string | null;
   includeKeywords: string[];
   excludeKeywords: string[];
@@ -56,6 +57,8 @@ export default function SearchPage() {
   if (error) return <main className="container"><div className="card"><div className="error">{error}</div></div></main>;
   if (!data) return <main className="container"><div className="card">Loading...</div></main>;
 
+  const sessionLabel = data.sessionStatus === "SIGNED_IN" ? "LinkedIn session: SIGNED IN" : data.sessionStatus === "SIGNED_OUT" ? "LinkedIn session: SIGNED OUT" : "LinkedIn session: UNKNOWN";
+
   return (
     <main className="container">
       <div className="toolbar">
@@ -68,12 +71,19 @@ export default function SearchPage() {
 
       <div className="stats">
         <div className="stat">Status: <strong>{data.status}</strong></div>
+        <div className="stat">{sessionLabel}</div>
         <div className="stat">Posts: <strong>{data.postUrls.length}</strong></div>
         <div className="stat">Engagements: <strong>{data.totalEngagements}</strong></div>
         <div className="stat">Unique people: <strong>{data.uniquePeople}</strong></div>
         <div className="stat">ICP matches: <strong>{matched.length}</strong></div>
       </div>
 
+      {data.sessionStatus === "SIGNED_OUT" && (
+        <div className="notice">LinkedIn is signed out in the connected Windows Chrome Profile. Open that Chrome window, log in normally, keep it open, and run the search again.</div>
+      )}
+      {data.sessionStatus === "SIGNED_IN" && (
+        <div className="notice">LinkedIn session detected. The worker is reusing the connected Windows Chrome Profile.</div>
+      )}
       {data.error && <div className="notice">{data.error}</div>}
       <div className="notice">
         Include: {data.includeKeywords.join(", ") || "none"} · Exclude: {data.excludeKeywords.join(", ") || "none"} · Suppressed: {data.suppressionCount}
