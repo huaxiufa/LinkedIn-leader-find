@@ -20,19 +20,20 @@ enum EngagementType {
 }
 
 model Search {
-  id               String       @id @default(cuid())
-  postUrl          String
-  postUrls         String[]     @default([])
-  includeKeywords  String[]     @default([])
-  excludeKeywords  String[]     @default([])
-  suppressionUrls  String[]     @default([])
-  maxEngagersPerPost Int        @default(500)
-  status           SearchStatus @default(QUEUED)
-  error            String?
-  createdAt        DateTime     @default(now())
-  startedAt        DateTime?
-  completedAt      DateTime?
-  engagements      Engagement[]
+  id                  String       @id @default(cuid())
+  postUrl             String
+  postUrls            String[]     @default([])
+  includeKeywords     String[]     @default([])
+  excludeKeywords     String[]     @default([])
+  suppressionUrls     String[]     @default([])
+  maxEngagersPerPost  Int          @default(500)
+  status              SearchStatus @default(QUEUED)
+  sessionStatus       String       @default("UNKNOWN")
+  error               String?
+  createdAt           DateTime     @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+  engagements         Engagement[]
 
   @@index([status])
   @@index([createdAt])
