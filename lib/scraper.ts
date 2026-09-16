@@ -35,28 +35,37 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
     cdpHost = ipv4.address;
   }
 
-  const versionUrl = `http://${cdpHost}:${configured.port || "9222"}/json/version`;
-  console.log(`Connecting to existing Chrome CDP via ${versionUrl}`);
+  const versionUrl = `http://${cdpHost}:${configured.port || "9222"}`;
+  const versionEndpoint = `${versionUrl}/json/version`;
+  console.log(`Connecting to existing Chrome CDP via ${versionEndpoint}`);
 
-  const response = await fetch(versionUrl, { headers: { Host: cdpHost } });
+  // Verify the endpoint first. Using the resolved IPv4 avoids Chrome's
+  // Host-header restriction when the request originates from Docker.
+  const response = await fetch(versionEndpoint, {
+    headers: { Host: cdpHost },
+  });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new Error(`Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}${detail ? `: ${clean(detail)}` : ""}`);
+    throw new Error(`Chrome CDP endpoint returned HTTP ${response.status} at ${versionEndpoint}${detail ? `: ${clean(detail)}` : ""}`);
   }
 
-  const version = (await response.json()) as { webSocketDebuggerUrl?: string };
-  if (!version.webSocketDebuggerUrl) throw new Error("Chrome CDP /json/version did not provide webSocketDebuggerUrl.");
+  const version = (await response.json()) as { Browser?: string; webSocketDebuggerUrl?: string };
+  if (!version.webSocketDebuggerUrl) {
+    throw new Error("Chrome CDP /json/version did not provide webSocketDebuggerUrl.");
+  }
+  console.log(`Chrome CDP browser: ${version.Browser ?? "unknown"}`);
 
-  const wsUrl = version.webSocketDebuggerUrl.replace(
-    /^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i,
-    `ws://${cdpHost}`
-  );
-
-  console.log(`Connecting to Chrome CDP websocket: ${wsUrl}`);
-  const browser = await chromium.connectOverCDP(wsUrl);
-  const context = browser.contexts()[0];
+  // Connect through the HTTP CDP endpoint rather than manually opening the
+  // browser websocket. Playwright handles the CDP initialization and target
+  // discovery more reliably this way. The endpoint uses the resolved IPv4 so
+  // Chrome accepts the Host header.
+  console.log(`Connecting Playwright to Chrome CDP endpoint: ${versionUrl}`);
+  const browser = await chromium.connectOverCDP(versionUrl, { timeout: 120000 });
+  const contexts = browser.contexts();
+  const context = contexts[0];
   if (!context) throw new Error("Chrome CDP is connected, but no browser context is available.");
 
+  // Never navigate the user's existing tab. The scraper gets its own tab.
   const page = await context.newPage();
   console.log("Created dedicated LinkedIn scraping tab; existing Chrome tabs remain untouched.");
   return { browser, context, page };
