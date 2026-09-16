@@ -58,6 +58,7 @@ async function collectReactionPeople(page: Page, max: number) {
   const seen = new Set<string>();
   const results: Array<{ profileUrl: string; name: string; headline?: string }> = [];
 
+  // First use normal profile links already exposed in the reaction surface.
   for (let round = 0; round < 50 && results.length < max; round++) {
     const cards = page.locator('[role="dialog"] li, [role="dialog"] [role="listitem"], [role="dialog"] [data-view-name], [role="dialog"] .mn-pymk-list__card, [role="dialog"] div');
     const count = await cards.count().catch(() => 0);
@@ -100,6 +101,81 @@ async function collectReactionPeople(page: Page, max: number) {
     if (!scrollResult.scrolled) break;
     await page.waitForTimeout(700);
     if (!discoveredThisRound && round > 5) break;
+  }
+
+  // Some LinkedIn reaction lists render the person as a clickable UI element without
+  // putting the profile URL in href. In that case, open the person normally, capture
+  // the resulting LinkedIn URL, then immediately return/close it. No bypass is used.
+  if (results.length < max) {
+    const opened = await collectReactionPeopleByOpening(page, max - results.length, seen);
+    results.push(...opened);
+  }
+
+  return results;
+}
+
+async function collectReactionPeopleByOpening(page: Page, max: number, seen: Set<string>) {
+  const results: Array<{ profileUrl: string; name: string; headline?: string }> = [];
+  const dialog = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]').filter({ visible: true }).first();
+  if (!await dialog.count().catch(() => 0)) return results;
+
+  const candidates = dialog.locator('a, [role="link"], button, [role="button"]');
+  const count = Math.min(await candidates.count().catch(() => 0), 1000);
+  const visitedNames = new Set<string>();
+
+  for (let i = 0; i < count && results.length < max; i++) {
+    const candidate = candidates.nth(i);
+    const meta = await candidate.evaluate(el => ({
+      text: (el.textContent ?? "").replace(/\s+/g, " ").trim(),
+      aria: el.getAttribute("aria-label") ?? "",
+      title: el.getAttribute("title") ?? "",
+      href: (el as HTMLAnchorElement).href ?? ""
+    })).catch(() => null);
+    if (!meta) continue;
+
+    const name = clean(meta.text || meta.aria || meta.title);
+    if (!name || name.length < 2 || name.length > 120 || visitedNames.has(name)) continue;
+    if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all)$/i.test(name)) continue;
+    visitedNames.add(name);
+
+    const directHref = normalizeLinkedInUrl(meta.href);
+    if (directHref.includes("linkedin.com/in/") && !seen.has(directHref)) {
+      seen.add(directHref);
+      results.push({ profileUrl: directHref, name });
+      continue;
+    }
+
+    const beforeUrl = page.url();
+    let popup: Page | undefined;
+    try {
+      popup = await page.waitForEvent("popup", { timeout: 1200 }).catch(() => undefined);
+      await candidate.click({ timeout: 3000 });
+      await page.waitForTimeout(900);
+    } catch {
+      if (popup) await popup.close().catch(() => {});
+      continue;
+    }
+
+    const targetPage = popup && !popup.isClosed() ? popup : page;
+    const targetUrl = normalizeLinkedInUrl(targetPage.url());
+    if (targetUrl.includes("linkedin.com/in/") && !seen.has(targetUrl)) {
+      seen.add(targetUrl);
+      results.push({ profileUrl: targetUrl, name });
+    }
+
+    if (popup && !popup.isClosed()) {
+      await popup.close().catch(() => {});
+    } else if (page.url() !== beforeUrl) {
+      await page.goBack({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    }
+
+    // If clicking opened a profile modal but did not change the URL, close only that
+    // modal and continue from the reaction list.
+    const closeButton = page.getByRole("button", { name: /close/i }).last();
+    if (await closeButton.count().catch(() => 0)) {
+      await closeButton.click({ timeout: 1000 }).catch(() => {});
+    }
   }
 
   return results;
@@ -178,7 +254,7 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
 
       const people = await collectReactionPeople(page, options.maxReactions ?? 500);
       for (const person of people) engagements.push({ profileUrl: person.profileUrl, name: person.name, headline: person.headline, jobTitle: person.headline, type: "REACTION", reactionType: "UNKNOWN" });
-      if (!people.length) warnings.push("Reaction dialog opened but LinkedIn did not expose profile links in its DOM. The worker logged a reaction surface snapshot; no customer profile pages were opened.");
+      if (!people.length) warnings.push("Reaction dialog opened but no LinkedIn profile URL could be captured. The worker tried normal profile clicks and did not bypass any access controls.");
     } else warnings.push("A reaction-user list trigger was not exposed by the page.");
 
     const deduped = new Map<string, ScrapedEngagement>();
