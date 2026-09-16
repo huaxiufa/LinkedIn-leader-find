@@ -89,13 +89,11 @@ async function collectReactionPeople(page: Page, max: number) {
       const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"], .artdeco-modal, [data-test-modal]'));
       const candidates = dialogs.flatMap(d => [d, ...Array.from(d.querySelectorAll<HTMLElement>('div, ul, ol'))]);
       const target = candidates.filter(el => el.scrollHeight > el.clientHeight + 20).sort((a,b) => b.scrollHeight - a.scrollHeight)[0];
-      const dialogText = dialogs.map(d => d.innerText).join("\n").slice(0, 3000);
-      const anchors = dialogs.reduce((n, d) => n + d.querySelectorAll('a').length, 0);
-      if (!target) return { scrolled: false, dialogText, anchors };
+      if (!target) return { scrolled: false };
       const before = target.scrollTop;
       target.scrollTop = Math.min(target.scrollTop + Math.max(300, target.clientHeight * 0.9), target.scrollHeight);
-      return { scrolled: target.scrollTop > before, dialogText, anchors };
-    }).catch(() => ({ scrolled: false, dialogText: "", anchors: 0 }));
+      return { scrolled: target.scrollTop > before };
+    }).catch(() => ({ scrolled: false }));
 
     if (!scrollResult.scrolled) break;
     await page.waitForTimeout(700);
@@ -112,11 +110,13 @@ async function collectReactionPeople(page: Page, max: number) {
 
 async function collectReactionPeopleByOpening(page: Page, max: number, seen: Set<string>) {
   const results: Array<{ profileUrl: string; name: string; headline?: string }> = [];
-  const dialog = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]').filter({ visible: true }).first();
+  const dialog = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]').first();
   if (!await dialog.count().catch(() => 0)) return results;
 
-  const candidates = dialog.locator('a, [role="link"], button, [role="button"]');
-  const count = Math.min(await candidates.count().catch(() => 0), 1000);
+  // LinkedIn can render reaction rows as div/span elements with click handlers rather
+  // than normal anchors. Include common keyboard/clickable attributes as well.
+  const candidates = dialog.locator('a, [role="link"], button, [role="button"], [tabindex="0"], [data-control-name], [data-view-name], [data-test-id]');
+  const count = Math.min(await candidates.count().catch(() => 0), 1500);
   const visitedNames = new Set<string>();
 
   for (let i = 0; i < count && results.length < max; i++) {
@@ -125,13 +125,17 @@ async function collectReactionPeopleByOpening(page: Page, max: number, seen: Set
       text: (el.textContent ?? "").replace(/\s+/g, " ").trim(),
       aria: el.getAttribute("aria-label") ?? "",
       title: el.getAttribute("title") ?? "",
-      href: (el as HTMLAnchorElement).href ?? ""
+      href: (el as HTMLAnchorElement).href ?? "",
+      control: el.getAttribute("data-control-name") ?? "",
+      view: el.getAttribute("data-view-name") ?? ""
     })).catch(() => null);
     if (!meta) continue;
 
-    const name = clean(meta.text || meta.aria || meta.title);
+    const rawName = meta.text || meta.aria || meta.title;
+    const name = clean(rawName);
     if (!name || name.length < 2 || name.length > 120 || visitedNames.has(name)) continue;
-    if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all)$/i.test(name)) continue;
+    if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all|people who reacted)$/i.test(name)) continue;
+    if (/^(button|link|tab|menuitem|listitem)$/i.test(name)) continue;
     visitedNames.add(name);
 
     const directHref = normalizeLinkedInUrl(meta.href);
@@ -142,33 +146,46 @@ async function collectReactionPeopleByOpening(page: Page, max: number, seen: Set
     }
 
     const beforeUrl = page.url();
+    const pagesBefore = page.context().pages();
     let popup: Page | undefined;
+
     try {
-      popup = await page.waitForEvent("popup", { timeout: 1200 }).catch(() => undefined);
-      await candidate.click({ timeout: 3000 });
-      await page.waitForTimeout(900);
+      const popupPromise = page.waitForEvent("popup", { timeout: 1500 }).catch(() => undefined);
+      await candidate.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      await candidate.click({ timeout: 4000, force: false }).catch(async () => {
+        await candidate.click({ timeout: 2500, force: true });
+      });
+      popup = await popupPromise;
+      await page.waitForTimeout(1000);
     } catch {
-      if (popup) await popup.close().catch(() => {});
       continue;
     }
 
-    const targetPage = popup && !popup.isClosed() ? popup : page;
+    const currentPages = page.context().pages();
+    const newPage = currentPages.find(p => !pagesBefore.includes(p) && !p.isClosed());
+    const targetPage = popup && !popup.isClosed() ? popup : (newPage ?? page);
     const targetUrl = normalizeLinkedInUrl(targetPage.url());
+
     if (targetUrl.includes("linkedin.com/in/") && !seen.has(targetUrl)) {
       seen.add(targetUrl);
       results.push({ profileUrl: targetUrl, name });
+      console.log(`Captured reaction profile URL: ${targetUrl}`);
     }
 
     if (popup && !popup.isClosed()) {
       await popup.close().catch(() => {});
+    } else if (newPage && !newPage.isClosed()) {
+      await newPage.close().catch(() => {});
     } else if (page.url() !== beforeUrl) {
-      await page.goBack({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
-      await page.waitForTimeout(500);
+      await page.goBack({ waitUntil: "domcontentloaded", timeout: 12000 }).catch(() => {});
+      await page.waitForTimeout(700);
     }
 
+    // If LinkedIn opened an in-page profile modal instead of navigating, close it and
+    // continue with the reaction list.
     const closeButton = page.getByRole("button", { name: /close/i }).last();
     if (await closeButton.count().catch(() => 0)) {
-      await closeButton.click({ timeout: 1000 }).catch(() => {});
+      await closeButton.click({ timeout: 1200 }).catch(() => {});
     }
   }
 
@@ -183,25 +200,16 @@ async function inspectReactionSurface(page: Page) {
     var links = surface ? Array.from(surface.querySelectorAll('a')).slice(0, 50).map(function (a) {
       return { href: a.href, text: compact(a.textContent), aria: a.getAttribute('aria-label'), title: a.getAttribute('title') };
     }) : [];
-    var buttons = surface ? Array.from(surface.querySelectorAll('button')).slice(0, 50).map(function (b) {
-      return { text: compact(b.textContent), aria: b.getAttribute('aria-label'), title: b.getAttribute('title'), dataView: b.getAttribute('data-view-name') };
+    var buttons = surface ? Array.from(surface.querySelectorAll('button, [role="button"], [tabindex="0"]')).slice(0, 100).map(function (b) {
+      return { text: compact(b.textContent), aria: b.getAttribute('aria-label'), title: b.getAttribute('title'), dataView: b.getAttribute('data-view-name'), dataTest: b.getAttribute('data-test-id'), control: b.getAttribute('data-control-name') };
     }) : [];
     var candidateAttributes = surface ? Array.from(surface.querySelectorAll('*')).flatMap(function (el) {
       return Array.from(el.attributes).filter(function (a) {
-        return /href|profile|member|entity|urn|actor|user|person/i.test(a.name) || /linkedin\\.com\\/in\\//i.test(a.value);
+        return /href|profile|member|entity|urn|actor|user|person|control|view/i.test(a.name) || /linkedin\\.com\\/in\\//i.test(a.value);
       }).map(function (a) { return { name: a.name, value: a.value.slice(0, 500) }; });
-    }).slice(0, 120) : [];
+    }).slice(0, 200) : [];
     var text = compact(surface ? surface.innerText : '').slice(0, 5000);
-    return {
-      surfaceCount: surfaces.length,
-      surfaceTag: surface ? surface.tagName : '',
-      surfaceClass: surface ? String(surface.className || '') : '',
-      text: text,
-      links: links,
-      buttons: buttons,
-      candidateAttributes: candidateAttributes,
-      bodyProfileLinks: document.querySelectorAll('a[href*="/in/"]').length
-    };
+    return { surfaceCount: surfaces.length, surfaceTag: surface ? surface.tagName : '', surfaceClass: surface ? String(surface.className || '') : '', text: text, links: links, buttons: buttons, candidateAttributes: candidateAttributes, bodyProfileLinks: document.querySelectorAll('a[href*="/in/"]').length };
   })()`;
   return page.evaluate(script).catch(error => ({ error: String(error) }));
 }
