@@ -1,4 +1,5 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { lookup } from "node:dns/promises";
 import { normalizeLinkedInUrl } from "./normalize";
 
 export type ScrapedEngagement = {
@@ -29,27 +30,30 @@ function inferJobTitle(headline?: string) {
 }
 
 async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
-  const cdpUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
-  const baseUrl = cdpUrl.replace(/\/$/, "");
-  const versionUrl = `${baseUrl}/json/version`;
-  console.log(`Connecting to existing Chrome via CDP: ${baseUrl}`);
+  const configuredUrl = process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222";
+  const configured = new URL(configuredUrl);
 
-  // Chrome's DevTools HTTP server can reject requests whose Host header is
-  // not the local host name. Docker reaches Windows through host.docker.internal,
-  // so explicitly use the same Host value Chrome sees for local requests.
-  let response: Response;
-  try {
-    response = await fetch(versionUrl, {
-      headers: { Host: "localhost:9222" },
-    });
-  } catch (error) {
-    throw new Error(`Cannot reach Chrome CDP at ${versionUrl}: ${error instanceof Error ? error.message : String(error)}`);
+  // Chrome rejects a Host header such as "host.docker.internal" for its
+  // DevTools HTTP endpoint. Resolve the Docker host gateway to an IP first,
+  // then make the request using that IP as both URL host and Host header.
+  let cdpHost = configured.hostname;
+  if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(cdpHost) && cdpHost !== "localhost") {
+    const addresses = await lookup(cdpHost, { all: true });
+    const ipv4 = addresses.find((entry) => entry.family === 4);
+    if (!ipv4) throw new Error(`Could not resolve ${cdpHost} to an IPv4 address from the Docker container.`);
+    cdpHost = ipv4.address;
   }
 
+  const versionUrl = `http://${cdpHost}:${configured.port || "9222"}/json/version`;
+  console.log(`Connecting to existing Chrome CDP via ${versionUrl}`);
+
+  const response = await fetch(versionUrl, {
+    headers: { Host: cdpHost },
+  });
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
+    const detail = await response.text().catch(() => "");
     throw new Error(
-      `Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}${body ? `: ${body.slice(0, 300)}` : ""}`
+      `Chrome CDP endpoint returned HTTP ${response.status} at ${versionUrl}${detail ? `: ${clean(detail)}` : ""}`
     );
   }
 
@@ -58,10 +62,10 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
     throw new Error("Chrome CDP /json/version did not provide webSocketDebuggerUrl.");
   }
 
-  const cdpHost = new URL(cdpUrl).hostname;
-  const wsUrl = version.webSocketDebuggerUrl
-    .replace(/^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i, `ws://${cdpHost}`)
-    .replace(/^ws:\/\/localhost(?=:|\/)/i, `ws://${cdpHost}`);
+  const wsUrl = version.webSocketDebuggerUrl.replace(
+    /^ws:\/\/(localhost|127\.0\.0\.1)(?=:|\/)/i,
+    `ws://${cdpHost}`
+  );
 
   console.log(`Connecting to Chrome CDP websocket: ${wsUrl}`);
   const browser = await chromium.connectOverCDP(wsUrl);
