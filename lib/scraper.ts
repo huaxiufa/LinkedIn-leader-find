@@ -86,41 +86,57 @@ async function collectReactionPeople(page: Page, max: number) {
     if (results.length >= max) break;
 
     const scrollResult = await page.evaluate(() => {
-      const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
+      const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"], .artdeco-modal, [data-test-modal]'));
       const candidates = dialogs.flatMap(d => [d, ...Array.from(d.querySelectorAll<HTMLElement>('div, ul, ol'))]);
       const target = candidates.filter(el => el.scrollHeight > el.clientHeight + 20).sort((a,b) => b.scrollHeight - a.scrollHeight)[0];
       const dialogText = dialogs.map(d => d.innerText).join("\n").slice(0, 3000);
-      const anchors = document.querySelectorAll('[role="dialog"] a').length;
+      const anchors = dialogs.reduce((n, d) => n + d.querySelectorAll('a').length, 0);
       if (!target) return { scrolled: false, dialogText, anchors };
       const before = target.scrollTop;
       target.scrollTop = Math.min(target.scrollTop + Math.max(300, target.clientHeight * 0.9), target.scrollHeight);
       return { scrolled: target.scrollTop > before, dialogText, anchors };
     }).catch(() => ({ scrolled: false, dialogText: "", anchors: 0 }));
 
-    if (!scrollResult.scrolled) {
-      if (!results.length) {
-        const diagnostics = await page.evaluate(() => {
-          const compact = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
-          const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-          const allDialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
-          const hrefs = dialog ? Array.from(dialog.querySelectorAll<HTMLAnchorElement>('a[href]')).slice(0, 30).map(a => ({ href: a.href, text: compact(a.textContent), aria: a.getAttribute("aria-label") })) : [];
-          const profileLikeAttrs = dialog ? Array.from(dialog.querySelectorAll<HTMLElement>('*')).flatMap(el => Array.from(el.attributes).filter(a => /href|profile|urn|entity|member/i.test(a.name)).map(a => ({ name: a.name, value: a.value.slice(0, 300) }))).slice(0, 80) : [];
-          return {
-            dialogCount: allDialogs.length,
-            dialogText: compact(dialog?.innerText).slice(0, 3000),
-            hrefs,
-            profileLikeAttrs,
-            bodyHasInLinks: document.querySelectorAll('a[href*="/in/"]').length
-          };
-        }).catch((error) => ({ error: String(error) }));
-        console.log("Reaction dialog diagnostics:", JSON.stringify(diagnostics));
-      }
-      break;
-    }
+    if (!scrollResult.scrolled) break;
     await page.waitForTimeout(700);
     if (!discoveredThisRound && round > 5) break;
   }
+
   return results;
+}
+
+async function inspectReactionSurface(page: Page) {
+  return page.evaluate(() => {
+    const compact = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const surfaces = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]'));
+    const surface = surfaces[0];
+    const links = surface ? Array.from(surface.querySelectorAll<HTMLAnchorElement>('a')).slice(0, 50).map(a => ({
+      href: a.href,
+      text: compact(a.textContent),
+      aria: a.getAttribute("aria-label"),
+      title: a.getAttribute("title")
+    })) : [];
+    const buttons = surface ? Array.from(surface.querySelectorAll<HTMLButtonElement>('button')).slice(0, 50).map(b => ({
+      text: compact(b.textContent),
+      aria: b.getAttribute("aria-label"),
+      title: b.getAttribute("title"),
+      dataView: b.getAttribute("data-view-name")
+    })) : [];
+    const candidateAttributes = surface ? Array.from(surface.querySelectorAll<HTMLElement>('*')).flatMap(el => Array.from(el.attributes)
+      .filter(a => /href|profile|member|entity|urn|actor|user|person/i.test(a.name) || /linkedin\.com\/in\//i.test(a.value))
+      .map(a => ({ name: a.name, value: a.value.slice(0, 500) }))).slice(0, 120) : [];
+    const text = compact(surface?.innerText).slice(0, 5000);
+    return {
+      surfaceCount: surfaces.length,
+      surfaceTag: surface?.tagName ?? "",
+      surfaceClass: surface?.className ?? "",
+      text,
+      links,
+      buttons,
+      candidateAttributes,
+      bodyProfileLinks: document.querySelectorAll('a[href*="/in/"]').length
+    };
+  }).catch(error => ({ error: String(error) }));
 }
 
 export async function scrapePublicPost(postUrl: string, options: { maxComments?: number; maxReactions?: number } = {}): Promise<ScrapeResult> {
@@ -157,9 +173,12 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
 
     if (triggerCount) {
       await page.waitForTimeout(1500);
+      const surface = await inspectReactionSurface(page);
+      console.log("Reaction surface snapshot:", JSON.stringify(surface));
+
       const people = await collectReactionPeople(page, options.maxReactions ?? 500);
       for (const person of people) engagements.push({ profileUrl: person.profileUrl, name: person.name, headline: person.headline, jobTitle: person.headline, type: "REACTION", reactionType: "UNKNOWN" });
-      if (!people.length) warnings.push("Reaction dialog opened but LinkedIn did not expose profile links in its DOM. Diagnostics were logged by the worker; no customer profile pages were opened.");
+      if (!people.length) warnings.push("Reaction dialog opened but LinkedIn did not expose profile links in its DOM. The worker logged a reaction surface snapshot; no customer profile pages were opened.");
     } else warnings.push("A reaction-user list trigger was not exposed by the page.");
 
     const deduped = new Map<string, ScrapedEngagement>();
