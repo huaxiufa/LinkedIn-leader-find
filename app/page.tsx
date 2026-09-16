@@ -5,9 +5,11 @@ import { useRouter } from "next/navigation";
 
 export default function HomePage() {
   const router = useRouter();
-  const [postUrl, setPostUrl] = useState("");
-  const [includeKeywords, setIncludeKeywords] = useState("CEO, Founder, Co-Founder, VP, Head of, Director");
-  const [excludeKeywords, setExcludeKeywords] = useState("Intern, Student");
+  const [postUrls, setPostUrls] = useState("");
+  const [includeKeywords, setIncludeKeywords] = useState("founder, CEO, co-founder, VP, head of, director, growth, marketing");
+  const [excludeKeywords, setExcludeKeywords] = useState("student, intern");
+  const [suppressionUrls, setSuppressionUrls] = useState("");
+  const [maxEngagersPerPost, setMaxEngagersPerPost] = useState("500");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -15,12 +17,11 @@ export default function HomePage() {
     e.preventDefault();
     setError("");
     setLoading(true);
-
     try {
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ postUrl, includeKeywords, excludeKeywords }),
+        body: JSON.stringify({ postUrls, includeKeywords, excludeKeywords, suppressionUrls, maxEngagersPerPost }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to create search");
@@ -33,49 +34,35 @@ export default function HomePage() {
 
   return (
     <main className="container">
-      <div className="card" style={{ maxWidth: 760, margin: "60px auto" }}>
+      <div className="card" style={{ maxWidth: 820, margin: "60px auto" }}>
         <h1>LinkedIn Lead Finder</h1>
-        <p className="muted">
-          Enter a LinkedIn post URL, collect publicly accessible engagement data,
-          deduplicate people, and filter by job title.
-        </p>
+        <p className="muted">Paste one or more LinkedIn post URLs. Find commenters and publicly visible reactors, deduplicate them, and keep only people matching your job-title ICP.</p>
 
         <form onSubmit={submit}>
-          <label>LinkedIn Post URL</label>
-          <input
-            required
-            value={postUrl}
-            onChange={(e) => setPostUrl(e.target.value)}
-            placeholder="https://www.linkedin.com/posts/..."
-          />
+          <label>LinkedIn Post URLs</label>
+          <textarea required value={postUrls} onChange={(e) => setPostUrls(e.target.value)} placeholder="One URL per line\nhttps://www.linkedin.com/posts/..." rows={5} />
 
-          <label>Include Job Title Keywords</label>
-          <textarea
-            value={includeKeywords}
-            onChange={(e) => setIncludeKeywords(e.target.value)}
-            placeholder="CEO, Founder, Marketing Director"
-          />
+          <label>Job Title Include Keywords</label>
+          <textarea value={includeKeywords} onChange={(e) => setIncludeKeywords(e.target.value)} placeholder="founder, growth, marketing" rows={3} />
 
-          <label>Exclude Job Title Keywords</label>
-          <textarea
-            value={excludeKeywords}
-            onChange={(e) => setExcludeKeywords(e.target.value)}
-            placeholder="Intern, Student"
-          />
+          <label>Job Title Exclude Keywords</label>
+          <textarea value={excludeKeywords} onChange={(e) => setExcludeKeywords(e.target.value)} placeholder="student, intern" rows={2} />
 
-          <div style={{ marginTop: 20 }}>
-            <button disabled={loading}>
-              {loading ? "Creating search..." : "Find Leads"}
-            </button>
-          </div>
+          <label>Suppression List <span className="muted">(optional)</span></label>
+          <textarea value={suppressionUrls} onChange={(e) => setSuppressionUrls(e.target.value)} placeholder="LinkedIn profile URLs already contacted, one per line" rows={3} />
 
+          <label>Max Engagers Per Post</label>
+          <input type="number" min={1} max={5000} value={maxEngagersPerPost} onChange={(e) => setMaxEngagersPerPost(e.target.value)} />
+
+          <div style={{ marginTop: 20 }}><button disabled={loading}>{loading ? "Starting..." : "Find Leads"}</button></div>
           {error && <div className="error">{error}</div>}
         </form>
 
         <div className="notice">
-          This MVP does not bypass LinkedIn login, CAPTCHA, anti-bot systems,
-          rate limits, or access controls. Results depend on what the current
-          public page exposes.
+          Output is limited to name, headline/job title, profile URL, and the engagement signal (comment/reaction). No email or phone enrichment is included.
+        </div>
+        <div className="notice">
+          This MVP uses normal browser-visible behavior only. It does not bypass LinkedIn login, CAPTCHA, anti-bot systems, rate limits, or access controls.
         </div>
       </div>
     </main>
