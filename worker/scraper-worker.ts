@@ -8,12 +8,13 @@ async function processOne() {
   const search = await db.search.findFirst({ where: { status: "QUEUED" }, orderBy: { createdAt: "asc" } });
   if (!search) return false;
 
-  await db.search.update({ where: { id: search.id }, data: { status: "RUNNING", startedAt: new Date(), error: null } });
+  await db.search.update({ where: { id: search.id }, data: { status: "RUNNING", startedAt: new Date(), error: null, sessionStatus: "UNKNOWN" } });
 
   try {
     const postUrls = search.postUrls.length ? search.postUrls : [search.postUrl];
     const suppression = new Set(search.suppressionUrls.map(normalizeLinkedInUrl));
     const warnings: string[] = [];
+    let sessionStatus: "SIGNED_IN" | "SIGNED_OUT" | "UNKNOWN" = "UNKNOWN";
 
     for (const postUrl of postUrls) {
       try {
@@ -22,6 +23,12 @@ async function processOne() {
           maxReactions: search.maxEngagersPerPost,
         });
         warnings.push(...result.warnings.map((w) => `${postUrl}: ${w}`));
+
+        if (result.warnings.some((w) => /appears to be signed out of LinkedIn/i.test(w))) {
+          sessionStatus = "SIGNED_OUT";
+        } else if (sessionStatus !== "SIGNED_OUT") {
+          sessionStatus = "SIGNED_IN";
+        }
 
         for (const item of result.engagements) {
           const linkedinUrl = normalizeLinkedInUrl(item.profileUrl);
@@ -45,7 +52,6 @@ async function processOne() {
           });
 
           if (item.type === "COMMENT") {
-            // A comment is the stronger engagement signal. Replace any reaction row.
             await db.engagement.deleteMany({ where: { searchId: search.id, profileId: profile.id, type: "REACTION" } });
           } else {
             const existingComment = await db.engagement.findFirst({ where: { searchId: search.id, profileId: profile.id, type: "COMMENT" } });
@@ -81,13 +87,14 @@ async function processOne() {
       data: {
         status: "COMPLETED",
         completedAt: new Date(),
+        sessionStatus,
         error: warnings.length ? `Completed with warnings: ${warnings.join(" | ")}` : null,
       },
     });
   } catch (err) {
     await db.search.update({
       where: { id: search.id },
-      data: { status: "FAILED", completedAt: new Date(), error: err instanceof Error ? err.message : "Scraper failed." },
+      data: { status: "FAILED", completedAt: new Date(), sessionStatus: "UNKNOWN", error: err instanceof Error ? err.message : "Scraper failed." },
     });
   }
 
