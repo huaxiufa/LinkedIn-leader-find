@@ -1,43 +1,50 @@
 # LinkedIn Lead Finder
 
-A minimal local MVP for finding potential leads from a LinkedIn post.
+A minimal local MVP: enter a LinkedIn post URL, collect publicly accessible commenters/reactions, deduplicate people, filter by job-title keywords, and export a CSV.
 
-## What it does
+## Run with Docker (recommended on Windows)
 
-1. Input a LinkedIn post URL.
-2. Collect publicly accessible commenters and reaction users when the page exposes them.
-3. Deduplicate people by LinkedIn profile URL.
-4. Filter by job-title/headline keywords, with include and exclude lists.
-5. Export the matched lead list as CSV.
+Install only Docker Desktop. You do **not** need Node.js, npm, npx, Prisma, or Playwright installed on Windows.
 
-## Stack
-
-- Next.js + TypeScript
-- PostgreSQL + Prisma
-- Playwright scraper worker
-
-## Setup
-
-```bash
-cp .env.example .env
-docker compose up -d
-npm install
-npx playwright install chromium
-npx prisma generate
-npx prisma db push
-npm run dev
+```powershell
+git clone https://github.com/huaxiufa/LinkedIn-leader-find.git
+cd LinkedIn-leader-find
+docker compose up --build
 ```
 
-In another terminal:
+Then open:
 
-```bash
-npm run worker
+http://localhost:3000
+
+The first build downloads Node dependencies and the Chromium browser into the Docker image. Subsequent starts are much faster.
+
+To stop:
+
+```powershell
+docker compose down
 ```
 
-Then open `http://localhost:3000`.
+To stop and remove the local database volume too:
 
-## Notes
+```powershell
+docker compose down -v
+```
 
-This version intentionally does **not** use Apify, AI, CRM integrations, outreach, billing, or team features.
+## What runs in Docker
 
-The scraper only uses data normally exposed by the current page. It does not bypass LinkedIn login, CAPTCHA, anti-bot systems, rate limits, or access controls. LinkedIn may expose only a subset of engagement data without authentication, so reaction results can be incomplete.
+- `app`: Next.js web UI/API on port 3000
+- `worker`: Playwright scraping worker
+- `postgres`: PostgreSQL database on port 5432
+
+The app and worker automatically run Prisma setup against the Docker PostgreSQL service.
+
+## Scope
+
+- LinkedIn post URL input
+- Publicly accessible comments/reactions
+- Profile deduplication
+- Include/exclude title keywords
+- CSV export
+- No Apify, AI, CRM, outreach, billing, or team features
+
+The scraper does not bypass login, CAPTCHA, anti-bot systems, rate limits, or access controls. LinkedIn may expose only a subset of engagement data without authentication.
