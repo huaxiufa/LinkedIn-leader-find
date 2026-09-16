@@ -83,16 +83,28 @@ async function collectProfileLinks(page: Page, seen: Set<string>, type: "COMMENT
   return result;
 }
 
+function reactionDialog(page: Page) {
+  const dialogs = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]');
+  const likely = dialogs.filter({ hasText: /reactions?|people who reacted|likes?/i }).first();
+  return likely;
+}
+
 async function reactionSurfaceSnapshot(page: Page) {
   return page.evaluate(() => {
     const roots = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]'));
-    const root = roots[0];
+    const ranked = roots.map(root => ({ root, score: ((root.innerText || "").match(/reaction|people who reacted|likes?/gi) || []).length * 10000 + (root.innerText || "").length })).sort((a, b) => b.score - a.score);
+    const root = ranked[0]?.root;
     const compact = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
-    const clickable = root ? Array.from(root.querySelectorAll<HTMLElement>('a, button, [role="link"], [role="button"], [tabindex="0"]')).slice(0, 120).map(el => ({
+    const clickable = root ? Array.from(root.querySelectorAll<HTMLElement>('a, button, [role="link"], [role="button"], [tabindex="0"], span, div')).filter(el => {
+      const text = compact(el.textContent);
+      return text.length >= 2 && text.length <= 100 && el.children.length <= 3;
+    }).slice(0, 180).map(el => ({
+      tag: el.tagName,
       text: compact(el.textContent),
       aria: el.getAttribute("aria-label"),
       title: el.getAttribute("title"),
       href: (el as HTMLAnchorElement).href || el.getAttribute("data-test-profile-url") || el.getAttribute("data-profile-url"),
+      role: el.getAttribute("role"),
       control: el.getAttribute("data-control-name"),
       view: el.getAttribute("data-view-name"),
       test: el.getAttribute("data-test-id")
@@ -117,21 +129,25 @@ async function closeTransientProfile(page: Page) {
 async function collectReactionPeople(page: Page, max: number, warnings: string[]) {
   const seen = new Set<string>();
   const results: ScrapedEngagement[] = [];
+  const dialog = reactionDialog(page);
 
   for (let round = 0; round < 60 && results.length < max; round++) {
-    // First capture any normal /in/ links currently exposed by the reaction dialog.
-    const direct = await collectProfileLinks(page, seen, "REACTION", max - results.length);
+    const direct = await collectProfileLinks(dialog, seen, "REACTION", max - results.length);
     results.push(...direct);
     if (results.length >= max) break;
 
     const snapshot = await reactionSurfaceSnapshot(page);
     if (round === 0) console.log("Reaction surface snapshot:", JSON.stringify(snapshot));
 
-    const candidates = page.locator('[role="dialog"] a, [role="dialog"] [role="link"], [role="dialog"] button, [role="dialog"] [role="button"], [role="dialog"] [tabindex="0"], [role="dialog"] [data-control-name], [role="dialog"] [data-view-name], [role="dialog"] [data-test-id]');
-    const count = Math.min(await candidates.count().catch(() => 0), 2500);
-    let clicked = 0;
+    const root = dialog.count().catch(() => 0);
+    if (!await root) break;
 
-    // Re-query candidate metadata on every round because LinkedIn virtualizes reaction rows.
+    // LinkedIn often renders reaction names as spans inside a clickable row instead of <a>.
+    const candidates = dialog.locator('a, [role="link"], button, [role="button"], [tabindex="0"], [data-control-name], [data-view-name], [data-test-id], span[dir="ltr"], span.hoverable-link-text, [class*="hoverable-link-text"]');
+    const count = Math.min(await candidates.count().catch(() => 0), 3000);
+    let clicked = 0;
+    const visitedLabels = new Set<string>();
+
     for (let i = 0; i < count && results.length < max; i++) {
       const candidate = candidates.nth(i);
       const meta = await candidate.evaluate(el => ({
@@ -146,53 +162,49 @@ async function collectReactionPeople(page: Page, max: number, warnings: string[]
       if (!meta) continue;
 
       const label = clean(meta.text || meta.aria || meta.title);
-      if (!label || label.length < 2 || label.length > 160) continue;
-      if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all|people who reacted|button|link|tab|menuitem|listitem)$/i.test(label)) continue;
+      if (!label || label.length < 2 || label.length > 100 || visitedLabels.has(label)) continue;
+      if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all|people who reacted|button|link|tab|menuitem|listitem|all|celebrate|support|love|insightful|funny)$/i.test(label)) continue;
+      visitedLabels.add(label);
 
       const directHref = normalizeLinkedInUrl(meta.href);
       if (isProfileUrl(directHref) && !seen.has(directHref.toLowerCase())) {
         seen.add(directHref.toLowerCase());
-        results.push({ profileUrl: directHref, name: label, type: "REACTION", reactionType: "UNKNOWN", jobTitle: undefined });
+        results.push({ profileUrl: directHref, name: label, type: "REACTION", reactionType: "UNKNOWN" });
         continue;
       }
 
-      // A reaction row can be a div/span with a click handler. Use only normal UI clicks;
-      // never call private endpoints or fabricate a profile URL from a name.
       const beforeUrl = page.url();
       const beforePages = page.context().pages();
       try {
-        await candidate.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
-        const popupPromise = page.waitForEvent("popup", { timeout: 1200 }).catch(() => undefined);
-        await candidate.click({ timeout: 3000, force: false }).catch(async () => candidate.click({ timeout: 1800, force: true }));
+        await candidate.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+        const popupPromise = page.waitForEvent("popup", { timeout: 1000 }).catch(() => undefined);
+        await candidate.click({ timeout: 2500, force: false }).catch(async () => candidate.click({ timeout: 1500, force: true }));
         const popup = await popupPromise;
-        await page.waitForTimeout(900);
+        await page.waitForTimeout(800);
         clicked++;
 
         const pagesNow = page.context().pages();
         const newPage = pagesNow.find(p => !beforePages.includes(p) && !p.isClosed());
         const target = popup && !popup.isClosed() ? popup : (newPage ?? page);
         const targetUrl = normalizeLinkedInUrl(target.url());
-
         if (isProfileUrl(targetUrl) && !seen.has(targetUrl.toLowerCase())) {
           seen.add(targetUrl.toLowerCase());
           results.push({ profileUrl: targetUrl, name: label, type: "REACTION", reactionType: "UNKNOWN" });
           console.log(`Captured reaction profile URL by click: ${targetUrl}`);
         } else {
-          // LinkedIn may open a profile card/modal without changing the URL.
           const modalLinks = await collectProfileLinks(target, seen, "REACTION", max - results.length);
           results.push(...modalLinks);
-          if (modalLinks.length) console.log(`Captured ${modalLinks.length} reaction profile URL(s) from profile overlay.`);
         }
 
         if (popup && !popup.isClosed()) await popup.close().catch(() => {});
         if (newPage && !newPage.isClosed()) await newPage.close().catch(() => {});
         if (target === page && page.url() !== beforeUrl && !isProfileUrl(page.url())) {
-          await page.goBack({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
-          await page.waitForTimeout(500);
+          await page.goBack({ waitUntil: "domcontentloaded", timeout: 9000 }).catch(() => {});
+          await page.waitForTimeout(400);
         }
         await closeTransientProfile(page);
       } catch {
-        // Some reaction rows are not clickable; continue scanning the list.
+        // Continue. Some virtualized reaction rows are not directly clickable.
       }
     }
 
@@ -207,13 +219,16 @@ async function collectReactionPeople(page: Page, max: number, warnings: string[]
     }).catch(() => false);
 
     if (!scrolled && clicked === 0) break;
-    await page.waitForTimeout(650);
+    await page.waitForTimeout(600);
     if (!scrolled && round > 2) break;
   }
 
   if (!results.length) {
     const snapshot = await reactionSurfaceSnapshot(page);
-    warnings.push(`Reaction extraction found no profile URLs. Diagnostic: surface=${"surfaceCount" in snapshot ? snapshot.surfaceCount : "unknown"}, pageProfileLinks=${"profileLinksOnPage" in snapshot ? snapshot.profileLinksOnPage : "unknown"}.`);
+    const diagnostic = "error" in snapshot
+      ? `error=${snapshot.error}`
+      : `surfaces=${snapshot.surfaceCount}, pageProfileLinks=${snapshot.profileLinksOnPage}, text=${clean(snapshot.text).slice(0, 240)}`;
+    warnings.push(`Reaction extraction found no profile URLs. Diagnostic: ${diagnostic}`);
   }
   return results;
 }
@@ -275,7 +290,6 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
     for (const item of engagements) {
       const key = item.profileUrl.toLowerCase();
       const existing = deduped.get(key);
-      // Keep COMMENT as the primary engagement when the same person also reacted.
       if (!existing || (existing.type === "REACTION" && item.type === "COMMENT") || (!existing.headline && item.headline)) {
         deduped.set(key, item);
       }
