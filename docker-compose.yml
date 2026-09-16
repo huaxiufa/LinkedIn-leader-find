@@ -17,6 +17,23 @@ services:
       timeout: 5s
       retries: 10
 
+  browser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-lead-finder-browser
+    restart: unless-stopped
+    environment:
+      DISPLAY: ":99"
+      LINKEDIN_PROFILE_DIR: /data/linkedin-profile
+      LINKEDIN_CDP_PORT: "9222"
+    ports:
+      - "7900:7900"
+      - "9222:9222"
+    volumes:
+      - linkedin_profile:/data/linkedin-profile
+    command: sh ./worker/browser-entrypoint.sh
+
   app:
     build:
       context: .
@@ -29,6 +46,7 @@ services:
       SCRAPER_HEADLESS: "true"
       SCRAPER_MAX_COMMENTS: "500"
       SCRAPER_MAX_REACTIONS: "500"
+      LINKEDIN_CDP_URL: http://browser:9222
     ports:
       - "3000:3000"
     volumes:
@@ -38,6 +56,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      browser:
+        condition: service_started
     command: sh -c "npx prisma generate && npx prisma db push && npm run dev"
 
   worker:
@@ -49,16 +69,19 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/linkedin_leads?schema=public
       SCRAPER_POLL_MS: "3000"
-      SCRAPER_HEADLESS: "true"
       SCRAPER_MAX_COMMENTS: "500"
       SCRAPER_MAX_REACTIONS: "500"
+      LINKEDIN_CDP_URL: http://browser:9222
     volumes:
       - .:/app
       - /app/node_modules
     depends_on:
       postgres:
         condition: service_healthy
+      browser:
+        condition: service_started
     command: sh -c "npx prisma generate && npm run worker"
 
 volumes:
   postgres_data:
+  linkedin_profile:
