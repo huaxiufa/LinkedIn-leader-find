@@ -21,6 +21,12 @@ function profileUrl(value: string) {
   return /linkedin\.com\/in\//i.test(url) ? url : "";
 }
 
+function isGenericLabel(value: string) {
+  const text = clean(value).toLowerCase();
+  if (!text || text.length < 2 || text.length > 140) return true;
+  return /^(like|comment|repost|send|follow|most relevant|most recent|reactions?|likes?|people who reacted|close|cancel|done|back|next|previous|see all|show more|load more|connections?|grow your network|my network|notifications?|messaging|jobs|home|search|me|for business)$/i.test(text);
+}
+
 async function connectPage(): Promise<{ browser: any; page: Page }> {
   const configured = new URL(process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222");
   let host = configured.hostname;
@@ -44,15 +50,12 @@ async function connectPage(): Promise<{ browser: any; page: Page }> {
 async function findClickableReactionControl(page: Page, postUrl: string): Promise<Locator | null> {
   const postId = postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1] ?? "";
   const roots: Locator[] = [];
-  if (postId) {
-    roots.push(page.locator(`[data-urn*="${postId}"], [data-id*="${postId}"]`).first());
-  }
+  if (postId) roots.push(page.locator(`[data-urn*="${postId}"], [data-id*="${postId}"]`).first());
   roots.push(page.locator("article").filter({ hasText: /\breactions?\b/i }).first());
 
   for (const root of roots) {
     if (!(await root.count().catch(() => 0)) || !(await root.isVisible().catch(() => false))) continue;
-    const text = clean(await root.innerText().catch(() => ""));
-    if (!/\breactions?\b/i.test(text)) continue;
+    if (!/\breactions?\b/i.test(clean(await root.innerText().catch(() => "")))) continue;
 
     const exactTexts = root.getByText(/^\d+\s+reactions?$/i);
     const exactCount = Math.min(await exactTexts.count().catch(() => 0), 20);
@@ -74,9 +77,6 @@ async function findClickableReactionControl(page: Page, postUrl: string): Promis
     }
   }
 
-  // Last resort: locate the exact visible reaction-count text anywhere, then
-  // walk upward to its nearest interactive ancestor. This does not click generic
-  // navigation text such as "My Network".
   const exactTexts = page.getByText(/^\d+\s+reactions?$/i);
   const count = Math.min(await exactTexts.count().catch(() => 0), 30);
   for (let i = 0; i < count; i++) {
@@ -89,7 +89,7 @@ async function findClickableReactionControl(page: Page, postUrl: string): Promis
 }
 
 function reactionSurface(page: Page) {
-  const surfaces = page.locator('[role="dialog"], [role="listbox"], .artdeco-modal, .artdeco-popover');
+  const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
   return surfaces.filter({ hasText: /people who reacted|reactions?|likes?/i }).last();
 }
 
@@ -106,6 +106,48 @@ async function extractFromSurface(surface: Locator, seen: Set<string>, max: numb
     seen.add(href.toLowerCase());
     result.push({ profileUrl: href, name, type: "REACTION", reactionType: "UNKNOWN" });
   }
+  return result;
+}
+
+async function extractGlobalProfileLinks(page: Page, seen: Set<string>, max: number) {
+  const result: ReactionPerson[] = [];
+  const anchors = page.locator('a[href*="/in/"]');
+  const count = Math.min(await anchors.count().catch(() => 0), 3000);
+  for (let i = 0; i < count && result.length < max; i++) {
+    const anchor = anchors.nth(i);
+    if (!(await anchor.isVisible().catch(() => false))) continue;
+    const href = profileUrl(await anchor.getAttribute("href").catch(() => ""));
+    if (!href || seen.has(href.toLowerCase())) continue;
+    const name = clean((await anchor.textContent().catch(() => "")) || (await anchor.getAttribute("aria-label").catch(() => "")));
+    if (!name || isGenericLabel(name)) continue;
+    seen.add(href.toLowerCase());
+    result.push({ profileUrl: href, name, type: "REACTION", reactionType: "UNKNOWN" });
+  }
+  return result;
+}
+
+async function extractViaHoverCards(page: Page, surface: Locator, seen: Set<string>, max: number) {
+  const result: ReactionPerson[] = [];
+  const candidates = surface.locator('a, [role="link"], button, [role="button"], [tabindex="0"], span.hoverable-link-text, [class*="hoverable-link-text"]');
+  const count = Math.min(await candidates.count().catch(() => 0), 120);
+  const labels: string[] = [];
+
+  for (let i = 0; i < count && result.length < max; i++) {
+    const candidate = candidates.nth(i);
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    const label = clean((await candidate.innerText().catch(() => "")) || (await candidate.getAttribute("aria-label").catch(() => "")) || (await candidate.getAttribute("title").catch(() => "")));
+    if (isGenericLabel(label)) continue;
+    if (labels.length < 10) labels.push(label);
+
+    await candidate.hover({ timeout: 2500 }).catch(() => {});
+    await page.waitForTimeout(250);
+
+    const found = await extractGlobalProfileLinks(page, seen, max - result.length);
+    result.push(...found);
+    if (result.length >= max) break;
+  }
+
+  console.log(`Reaction hover diagnostics: candidates=${count}, sampleLabels=${JSON.stringify(labels)}`);
   return result;
 }
 
@@ -130,6 +172,7 @@ export async function scrapeReactions(postUrl: string, max = 500): Promise<{ rea
 
     const seen = new Set<string>();
     const reactions: ReactionPerson[] = [];
+
     for (let round = 0; round < 30 && reactions.length < max; round++) {
       const surface = reactionSurface(page);
       if (!(await surface.count().catch(() => 0))) break;
@@ -143,7 +186,27 @@ export async function scrapeReactions(postUrl: string, max = 500): Promise<{ rea
       const after = clean(await surface.innerText().catch(() => ""));
       if (after === before) break;
     }
-    if (!reactions.length) warnings.push("Reaction list opened, but no public LinkedIn profile URLs were exposed.");
+
+    if (reactions.length < max) {
+      const globalFound = await extractGlobalProfileLinks(page, seen, max - reactions.length);
+      reactions.push(...globalFound);
+    }
+
+    if (!reactions.length) {
+      const surface = reactionSurface(page);
+      if (await surface.count().catch(() => 0)) {
+        const hovered = await extractViaHoverCards(page, surface, seen, max);
+        reactions.push(...hovered);
+      }
+    }
+
+    if (!reactions.length) {
+      const surface = reactionSurface(page);
+      const surfaceText = clean(await surface.innerText().catch(() => ""));
+      console.log(`Reaction list diagnostics: surfaceCount=${await surface.count().catch(() => 0)}, text=${JSON.stringify(surfaceText.slice(0, 1200))}`);
+      warnings.push("Reaction list opened, but no public LinkedIn profile URLs were exposed.");
+    }
+
     return { reactions, warnings };
   } finally {
     await page.close().catch(() => {});
