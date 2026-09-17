@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "worker": "ts-node --transpile-only worker/scraper-worker.ts",
+    "worker": "tsx worker/scraper-worker.ts",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push"
   },
