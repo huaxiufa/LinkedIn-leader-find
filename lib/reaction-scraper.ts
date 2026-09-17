@@ -37,28 +37,56 @@ async function connectPage(): Promise<{ browser: any; page: Page }> {
   return { browser, page: await context.newPage() };
 }
 
-const surfaceSelector = '[role="dialog"], [role="listbox"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]';
-
-function reactionSurface(page: Page) {
-  return page.locator(surfaceSelector).filter({ hasText: /people who reacted|\breactions?\b|\blikes?\b/i }).last();
+async function findPostRoot(page: Page, postUrl: string): Promise<Locator | null> {
+  const id = postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1] ?? "";
+  if (id) {
+    const direct = page.locator(`[data-urn*="${id}"], [data-id*="${id}"]`);
+    const n = Math.min(await direct.count().catch(() => 0), 20);
+    for (let i = 0; i < n; i++) {
+      const node = direct.nth(i);
+      if (!(await node.isVisible().catch(() => false))) continue;
+      const article = node.locator("xpath=ancestor::article[1]");
+      if (await article.count().catch(() => 0)) return article;
+      return node;
+    }
+  }
+  const links = page.locator('a[href*="/posts/"], a[href*="/feed/update/"]');
+  const n = Math.min(await links.count().catch(() => 0), 100);
+  for (let i = 0; i < n; i++) {
+    const href = normalizeLinkedInUrl((await links.nth(i).getAttribute("href").catch(() => "")) || "").toLowerCase();
+    if (href && id && href.includes(id)) {
+      const article = links.nth(i).locator("xpath=ancestor::article[1]");
+      if (await article.count().catch(() => 0)) return article;
+    }
+  }
+  return page.locator("article").filter({ hasText: /\breactions?\b|\blikes?\b/i }).first();
 }
 
 async function findTrigger(page: Page, postUrl: string): Promise<Locator | null> {
-  const id = postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1] ?? "";
-  const roots: Locator[] = [];
-  if (id) roots.push(page.locator(`[data-urn*="${id}"], [data-id*="${id}"]`).first());
-  roots.push(page.locator("article").filter({ hasText: /\breactions?\b/i }).first());
-  for (const root of roots) {
-    if (!(await root.count().catch(() => 0)) || !(await root.isVisible().catch(() => false))) continue;
-    const exact = root.getByText(/^\d+\s+(?:reactions?|likes?)$/i);
-    for (let i = 0, n = Math.min(await exact.count().catch(() => 0), 10); i < n; i++) {
-      const node = exact.nth(i);
-      if (!(await node.isVisible().catch(() => false))) continue;
-      const clickable = node.locator("xpath=ancestor::*[self::button or @role='button' or self::a or @tabindex='0'][1]");
-      return (await clickable.count().catch(() => 0)) ? clickable : node;
-    }
+  const root = await findPostRoot(page, postUrl);
+  if (!root || !(await root.count().catch(() => 0))) return null;
+  const controls = root.locator("button, [role='button'], a, [tabindex='0']");
+  const n = Math.min(await controls.count().catch(() => 0), 250);
+  const diagnostics: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const c = controls.nth(i);
+    if (!(await c.isVisible().catch(() => false))) continue;
+    const text = clean(await c.innerText().catch(() => ""));
+    const aria = clean(await c.getAttribute("aria-label").catch(() => ""));
+    const title = clean(await c.getAttribute("title").catch(() => ""));
+    const data = clean(await c.getAttribute("data-view-name").catch(() => ""));
+    const combined = `${text} ${aria} ${title} ${data}`;
+    if (/reaction|like/i.test(combined)) diagnostics.push(combined.slice(0, 120));
+    if (/^\d[\d,.]*\s+(?:reactions?|likes?)$/i.test(text) || /^\d[\d,.]*\s+(?:reactions?|likes?)$/i.test(aria) || /^\d[\d,.]*\s+(?:reactions?|likes?)$/i.test(title)) return c;
+    if (/reaction|like/i.test(combined) && !/reply|follow|my network|notification|messaging/i.test(combined)) return c;
   }
+  if (diagnostics.length) console.log(`Reaction control candidates: ${diagnostics.slice(0, 20).join(" | ")}`);
+  console.log("No reaction control found inside identified post root.");
   return null;
+}
+
+function reactionSurface(page: Page) {
+  return page.locator('[role="dialog"], [role="listbox"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]').filter({ hasText: /people who reacted|\breactions?\b|\blikes?\b/i }).last();
 }
 
 async function extractSurface(surface: Locator, seen: Set<string>, max: number) {
@@ -82,19 +110,22 @@ export async function scrapeReactions(postUrl: string, max = 500): Promise<{ rea
   const { browser, page } = await connectPage();
   try {
     await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1800);
     const trigger = await findTrigger(page, postUrl);
-    if (!trigger) return { reactions: [], warnings: ["Could not locate the reaction count control inside the LinkedIn post."] };
-    console.log("Reaction control found by exact reaction-count text; clicking it.");
+    if (!trigger) return { reactions: [], warnings: ["Could not locate the reaction interaction control inside the LinkedIn post."] };
+    console.log("Reaction interaction control found by post-scoped detection; clicking it.");
     await trigger.scrollIntoViewIfNeeded().catch(() => {});
     await trigger.click({ timeout: 5000 }).catch(async () => trigger.click({ timeout: 5000, force: true }));
     await page.waitForTimeout(1000);
 
     const seen = new Set<string>();
     const reactions: ReactionPerson[] = [];
-    for (let round = 0; round < 40 && reactions.length < max; round++) {
+    for (let round = 0; round < 50 && reactions.length < max; round++) {
       const surface = reactionSurface(page);
-      if (!(await surface.count().catch(() => 0))) break;
+      if (!(await surface.count().catch(() => 0))) {
+        if (round === 0) console.log("Reaction surface not detected after click; no page-wide profile fallback will be used.");
+        break;
+      }
       const found = await extractSurface(surface, seen, max - reactions.length);
       reactions.push(...found);
       if (reactions.length >= max) break;
@@ -105,10 +136,7 @@ export async function scrapeReactions(postUrl: string, max = 500): Promise<{ rea
       const after = clean(await surface.innerText().catch(() => ""));
       if (after === before) break;
     }
-
-    if (!reactions.length) {
-      warnings.push("Reaction list opened, but no public LinkedIn profile URLs were exposed inside the reaction surface.");
-    }
+    if (!reactions.length) warnings.push("Reaction list opened, but no public LinkedIn profile URLs were exposed inside the reaction surface.");
     console.log(`Reaction extraction enriched records: ${reactions.length}`);
     return { reactions, warnings };
   } finally {
