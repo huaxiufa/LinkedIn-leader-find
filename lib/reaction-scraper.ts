@@ -27,6 +27,13 @@ function isGenericLabel(value: string) {
   return /^(like|comment|repost|send|follow|most relevant|most recent|reactions?|likes?|people who reacted|close|cancel|done|back|next|previous|see all|show more|load more|connections?|grow your network|my network|notifications?|messaging|jobs|home|search|me|for business)$/i.test(text);
 }
 
+function looksLikeHeadline(value: string, name: string) {
+  const text = clean(value);
+  if (!text || text === name || isGenericLabel(text)) return false;
+  if (/^(follow|connect|message|more|see more|open to work|contact info)$/i.test(text)) return false;
+  return text.length >= 5 && text.length <= 240;
+}
+
 async function connectPage(): Promise<{ browser: any; page: Page }> {
   const configured = new URL(process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222");
   let host = configured.hostname;
@@ -102,7 +109,7 @@ async function extractFromSurface(surface: Locator, seen: Set<string>, max: numb
     const href = profileUrl((await anchor.getAttribute("href").catch(() => "")) || (await anchor.getAttribute("data-profile-url").catch(() => "")) || (await anchor.getAttribute("data-test-profile-url").catch(() => "")) || "");
     if (!href || seen.has(href.toLowerCase())) continue;
     const name = clean((await anchor.textContent().catch(() => "")) || (await anchor.getAttribute("aria-label").catch(() => "")));
-    if (!name) continue;
+    if (!name || isGenericLabel(name)) continue;
     seen.add(href.toLowerCase());
     result.push({ profileUrl: href, name, type: "REACTION", reactionType: "UNKNOWN" });
   }
@@ -140,11 +147,39 @@ async function extractViaHoverCards(page: Page, surface: Locator, seen: Set<stri
     if (labels.length < 10) labels.push(label);
 
     await candidate.hover({ timeout: 2500 }).catch(() => {});
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(300);
 
-    const found = await extractGlobalProfileLinks(page, seen, max - result.length);
-    result.push(...found);
-    if (result.length >= max) break;
+    const hoverLinks = page.locator('a[href*="/in/"]');
+    const linkCount = Math.min(await hoverLinks.count().catch(() => 0), 3000);
+    for (let j = 0; j < linkCount && result.length < max; j++) {
+      const link = hoverLinks.nth(j);
+      if (!(await link.isVisible().catch(() => false))) continue;
+      const href = profileUrl(await link.getAttribute("href").catch(() => ""));
+      if (!href || seen.has(href.toLowerCase())) continue;
+      const name = clean((await link.textContent().catch(() => "")) || label);
+      if (!name || isGenericLabel(name)) continue;
+
+      let headline = "";
+      const card = link.locator("xpath=ancestor::*[self::div or self::section or @role='dialog'][1]");
+      if (await card.count().catch(() => 0)) {
+        const lines = (await card.innerText().catch(() => ""))
+          .split("\n")
+          .map((line) => clean(line))
+          .filter(Boolean);
+        const candidateHeadline = lines.find((line) => looksLikeHeadline(line, name));
+        if (candidateHeadline) headline = candidateHeadline;
+      }
+
+      seen.add(href.toLowerCase());
+      result.push({
+        profileUrl: href,
+        name,
+        headline: headline || undefined,
+        jobTitle: headline || undefined,
+        type: "REACTION",
+        reactionType: "UNKNOWN",
+      });
+    }
   }
 
   console.log(`Reaction hover diagnostics: candidates=${count}, sampleLabels=${JSON.stringify(labels)}`);
@@ -207,6 +242,7 @@ export async function scrapeReactions(postUrl: string, max = 500): Promise<{ rea
       warnings.push("Reaction list opened, but no public LinkedIn profile URLs were exposed.");
     }
 
+    console.log(`Reaction extraction enriched records: ${reactions.length}`);
     return { reactions, warnings };
   } finally {
     await page.close().catch(() => {});
