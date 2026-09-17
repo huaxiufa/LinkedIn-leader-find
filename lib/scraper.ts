@@ -36,7 +36,10 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   if (!version.webSocketDebuggerUrl) throw new Error("Chrome CDP did not return a browser WebSocket endpoint.");
   const browser = await chromium.connectOverCDP(version.webSocketDebuggerUrl, { timeout: 30000 });
   const context = browser.contexts()[0];
-  if (!context) throw new Error("Chrome CDP connected, but no browser context is available.");
+  if (!context) {
+    browser.disconnect();
+    throw new Error("Chrome CDP connected, but no browser context is available.");
+  }
   const page = await context.newPage();
   console.log("Created dedicated LinkedIn scraping tab; existing Chrome tabs remain untouched.");
   return { browser, context, page };
@@ -65,50 +68,36 @@ async function collectProfileLinks(scope: Locator, seen: Set<string>, type: "COM
 }
 
 function reactionDialog(page: Page) {
-  const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
-  return surfaces.filter({ hasText: /people who reacted|reactions?|likes?/i }).last();
-}
-
-async function visibleReactionSurfaces(page: Page) {
-  const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
-  const count = Math.min(await surfaces.count().catch(() => 0), 300);
-  const matches: Array<{ index: number; role: string; text: string; profileLinks: number; visible: boolean }> = [];
-  for (let i = 0; i < count; i++) {
-    const candidate = surfaces.nth(i);
-    const visible = await candidate.isVisible().catch(() => false);
-    if (!visible) continue;
-    const text = clean(await candidate.innerText().catch(() => ""));
-    if (!/people who reacted|reactions?|likes?/i.test(text)) continue;
-    const profileLinks = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
-    matches.push({ index: i, role: (await candidate.getAttribute("role").catch(() => "")) || "", text: text.slice(0, 700), profileLinks });
-  }
-  return matches;
+  const dialogs = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
+  return dialogs.filter({ hasText: /people who reacted|reactions?|likes?/i }).last();
 }
 
 async function reactionSurfaceSnapshot(page: Page) {
   const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
   const count = await surfaces.count().catch(() => 0);
-  const visible = await visibleReactionSurfaces(page);
-  const allVisible: Array<{ role: string; text: string; profileLinks: number }> = [];
-  const max = Math.min(count, 100);
-  for (let i = 0; i < max; i++) {
+  const visibleMatches: Array<{ index: number; links: number; text: string }> = [];
+  let best: Locator | null = null;
+  let bestScore = -1;
+  let bestText = "";
+  for (let i = 0; i < count; i++) {
     const candidate = surfaces.nth(i);
     if (!(await candidate.isVisible().catch(() => false))) continue;
     const text = clean(await candidate.innerText().catch(() => ""));
-    if (!text) continue;
-    const profileLinks = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
-    allVisible.push({ role: (await candidate.getAttribute("role").catch(() => "")) || "", text: text.slice(0, 500), profileLinks });
+    const links = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
+    const reactionWords = (text.match(/people who reacted|reactions?|likes?/gi) || []).length;
+    visibleMatches.push({ index: i, links, text: text.slice(0, 600) });
+    const score = links * 100000 + reactionWords * 1000 + text.length;
+    if (score > bestScore) { bestScore = score; best = candidate; bestText = text; }
   }
-  const bodyText = clean(await page.locator("body").innerText().catch(() => ""));
-  const reactionTextIndex = bodyText.search(/reactions?|people who reacted|likes?/i);
-  return {
-    url: page.url(),
-    surfaceCount: count,
-    visibleMatches: visible,
-    visibleSurfaces: allVisible.slice(-20),
-    bodyReactionContext: reactionTextIndex >= 0 ? bodyText.slice(Math.max(0, reactionTextIndex - 250), reactionTextIndex + 1000) : "",
-    profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0),
-  };
+  if (!best) return { url: page.url(), surfaceCount: count, visibleMatches, text: "", links: [], profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0), bodyReactionContext: clean(await page.locator("body").innerText().catch(() => "")).slice(0, 1500) };
+  const linksLocator = best.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
+  const linkCount = Math.min(await linksLocator.count().catch(() => 0), 80);
+  const links: Array<{ href: string; text: string; aria: string }> = [];
+  for (let i = 0; i < linkCount; i++) {
+    const link = linksLocator.nth(i);
+    links.push({ href: normalizeLinkedInUrl(await link.getAttribute("href").catch(() => "") || ""), text: clean(await link.textContent().catch(() => "")), aria: clean(await link.getAttribute("aria-label").catch(() => "")) });
+  }
+  return { url: page.url(), surfaceCount: count, visibleMatches, text: bestText.slice(0, 5000), links, profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0), selectedProfileLinks: linkCount, bodyReactionContext: clean(await page.locator("body").innerText().catch(() => "")).slice(0, 1500) };
 }
 
 async function closeTransientProfile(page: Page) {
@@ -142,7 +131,6 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
   const visitedLabels = new Set<string>();
   for (let i = 0; i < count && results.length < max; i++) {
     const candidate = candidates.nth(i);
-    if (!(await candidate.isVisible().catch(() => false))) continue;
     const label = clean((await candidate.textContent().catch(() => "")) || (await candidate.getAttribute("aria-label").catch(() => "")) || (await candidate.getAttribute("title").catch(() => "")));
     const href = normalizeLinkedInUrl((await candidate.getAttribute("href").catch(() => "")) || (await candidate.getAttribute("data-href").catch(() => "")) || (await candidate.getAttribute("data-profile-url").catch(() => "")) || (await candidate.getAttribute("data-test-profile-url").catch(() => "")) || "");
     if (!label || label.length < 2 || label.length > 140 || visitedLabels.has(label)) continue;
@@ -153,7 +141,6 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
       results.push({ profileUrl: href, name: label, type: "REACTION", reactionType: "UNKNOWN" });
       continue;
     }
-
     const beforePages = page.context().pages();
     const beforeUrl = page.url();
     try {
@@ -189,17 +176,18 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
 async function collectReactionPeople(page: Page, max: number, warnings: string[]) {
   const seen = new Set<string>();
   const results: ScrapedEngagement[] = [];
-  let dialog = reactionDialog(page);
   for (let round = 0; round < 60 && results.length < max; round++) {
+    const snapshot = await reactionSurfaceSnapshot(page);
+    let dialog = reactionDialog(page);
+    if (snapshot.visibleMatches.length) {
+      const best = [...snapshot.visibleMatches].sort((a, b) => b.links - a.links || b.text.length - a.text.length)[0];
+      dialog = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]').nth(best.index);
+    }
+    if (await dialog.count().catch(() => 0) === 0) break;
     const direct = await collectProfileLinks(dialog, seen, "REACTION", max - results.length);
     results.push(...direct);
     if (results.length >= max) break;
-    if (round === 0) console.log("Reaction surface snapshot:", JSON.stringify(await reactionSurfaceSnapshot(page)));
-    if (await dialog.count().catch(() => 0) === 0) {
-      const fallback = await visibleReactionSurfaces(page);
-      if (fallback.length) dialog = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]').nth(fallback[fallback.length - 1].index);
-    }
-    if (await dialog.count().catch(() => 0) === 0) break;
+    if (round === 0) console.log("Reaction surface snapshot:", JSON.stringify(snapshot));
     const clickedResults = await captureReactionCandidates(dialog, page, seen, max - results.length);
     results.push(...clickedResults);
     if (results.length >= max) break;
@@ -239,7 +227,7 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
   const maxComments = options.maxComments ?? 500;
   const warnings: string[] = [];
   const engagements: ScrapedEngagement[] = [];
-  const { page } = await connectToLinkedInBrowser();
+  const { browser, page } = await connectToLinkedInBrowser();
   try {
     await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(2500);
@@ -274,5 +262,9 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
     return { engagements: [...deduped.values()], warnings };
   } finally {
     await page.close().catch(() => {});
+    // Disconnect Playwright from the existing Windows Chrome instance without closing Chrome.
+    // Keeping the CDP connection open across jobs can eventually make a fresh connectOverCDP
+    // hang after the WebSocket connects. The dedicated scraping tab is closed above; Chrome stays open.
+    browser.disconnect();
   }
 }
