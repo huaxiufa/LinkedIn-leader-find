@@ -34,7 +34,8 @@ services:
       - "3000:3000"
     volumes:
       - .:/app
-      - /app/.next
+      - app_node_modules:/app/node_modules
+      - app_next:/app/.next
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +55,7 @@ services:
       LINKEDIN_CDP_URL: http://host.docker.internal:9222
     volumes:
       - .:/app
+      - worker_node_modules:/app/node_modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,3 +63,5 @@ services:
 
 volumes:
   postgres_data:
+  app_node_modules:
+  worker_node_modules:
