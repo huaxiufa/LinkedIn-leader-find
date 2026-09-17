@@ -52,7 +52,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: sh -c "npx prisma generate && npm run worker"
+    command: sh -c "npx prisma generate && npx tsx worker/scraper-worker.ts"
 
 volumes:
   postgres_data:
