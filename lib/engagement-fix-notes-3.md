@@ -1,1 +1,0 @@
-The scraper fix uses Playwright locator-based DOM inspection; no page.evaluate.
