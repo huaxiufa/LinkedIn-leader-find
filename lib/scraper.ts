@@ -65,33 +65,50 @@ async function collectProfileLinks(scope: Locator, seen: Set<string>, type: "COM
 }
 
 function reactionDialog(page: Page) {
-  const dialogs = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]');
-  return dialogs.filter({ hasText: /people who reacted|reactions?|likes?/i }).last();
+  const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
+  return surfaces.filter({ hasText: /people who reacted|reactions?|likes?/i }).last();
+}
+
+async function visibleReactionSurfaces(page: Page) {
+  const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
+  const count = Math.min(await surfaces.count().catch(() => 0), 300);
+  const matches: Array<{ index: number; role: string; text: string; profileLinks: number; visible: boolean }> = [];
+  for (let i = 0; i < count; i++) {
+    const candidate = surfaces.nth(i);
+    const visible = await candidate.isVisible().catch(() => false);
+    if (!visible) continue;
+    const text = clean(await candidate.innerText().catch(() => ""));
+    if (!/people who reacted|reactions?|likes?/i.test(text)) continue;
+    const profileLinks = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
+    matches.push({ index: i, role: (await candidate.getAttribute("role").catch(() => "")) || "", text: text.slice(0, 700), profileLinks });
+  }
+  return matches;
 }
 
 async function reactionSurfaceSnapshot(page: Page) {
-  const dialogs = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]');
-  const count = await dialogs.count().catch(() => 0);
-  let best: Locator | null = null;
-  let bestScore = -1;
-  let bestText = "";
-  let bestLinks = 0;
-  for (let i = 0; i < count; i++) {
-    const candidate = dialogs.nth(i);
+  const surfaces = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]');
+  const count = await surfaces.count().catch(() => 0);
+  const visible = await visibleReactionSurfaces(page);
+  const allVisible: Array<{ role: string; text: string; profileLinks: number }> = [];
+  const max = Math.min(count, 100);
+  for (let i = 0; i < max; i++) {
+    const candidate = surfaces.nth(i);
+    if (!(await candidate.isVisible().catch(() => false))) continue;
     const text = clean(await candidate.innerText().catch(() => ""));
-    const links = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
-    const score = links * 100000 + (text.match(/people who reacted|reactions?|likes?/gi) || []).length * 1000 + text.length;
-    if (score > bestScore) { bestScore = score; best = candidate; bestText = text; bestLinks = links; }
+    if (!text) continue;
+    const profileLinks = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
+    allVisible.push({ role: (await candidate.getAttribute("role").catch(() => "")) || "", text: text.slice(0, 500), profileLinks });
   }
-  if (!best) return { url: page.url(), surfaceCount: count, text: "", links: [], clickable: [], profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0) };
-  const linksLocator = best.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
-  const linkCount = Math.min(await linksLocator.count().catch(() => 0), 80);
-  const links: Array<{ href: string; text: string; aria: string }> = [];
-  for (let i = 0; i < linkCount; i++) {
-    const link = linksLocator.nth(i);
-    links.push({ href: normalizeLinkedInUrl(await link.getAttribute("href").catch(() => "") || ""), text: clean(await link.textContent().catch(() => "")), aria: clean(await link.getAttribute("aria-label").catch(() => "")) });
-  }
-  return { url: page.url(), surfaceCount: count, text: bestText.slice(0, 5000), links, clickable: [], profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0), selectedProfileLinks: bestLinks };
+  const bodyText = clean(await page.locator("body").innerText().catch(() => ""));
+  const reactionTextIndex = bodyText.search(/reactions?|people who reacted|likes?/i);
+  return {
+    url: page.url(),
+    surfaceCount: count,
+    visibleMatches: visible,
+    visibleSurfaces: allVisible.slice(-20),
+    bodyReactionContext: reactionTextIndex >= 0 ? bodyText.slice(Math.max(0, reactionTextIndex - 250), reactionTextIndex + 1000) : "",
+    profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0),
+  };
 }
 
 async function closeTransientProfile(page: Page) {
@@ -125,6 +142,7 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
   const visitedLabels = new Set<string>();
   for (let i = 0; i < count && results.length < max; i++) {
     const candidate = candidates.nth(i);
+    if (!(await candidate.isVisible().catch(() => false))) continue;
     const label = clean((await candidate.textContent().catch(() => "")) || (await candidate.getAttribute("aria-label").catch(() => "")) || (await candidate.getAttribute("title").catch(() => "")));
     const href = normalizeLinkedInUrl((await candidate.getAttribute("href").catch(() => "")) || (await candidate.getAttribute("data-href").catch(() => "")) || (await candidate.getAttribute("data-profile-url").catch(() => "")) || (await candidate.getAttribute("data-test-profile-url").catch(() => "")) || "");
     if (!label || label.length < 2 || label.length > 140 || visitedLabels.has(label)) continue;
@@ -136,8 +154,6 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
       continue;
     }
 
-    // LinkedIn sometimes renders reaction users as clickable text without an href.
-    // Clicking that visible user entry can open a profile preview containing a real /in/ URL.
     const beforePages = page.context().pages();
     const beforeUrl = page.url();
     try {
@@ -173,12 +189,16 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
 async function collectReactionPeople(page: Page, max: number, warnings: string[]) {
   const seen = new Set<string>();
   const results: ScrapedEngagement[] = [];
-  const dialog = reactionDialog(page);
+  let dialog = reactionDialog(page);
   for (let round = 0; round < 60 && results.length < max; round++) {
     const direct = await collectProfileLinks(dialog, seen, "REACTION", max - results.length);
     results.push(...direct);
     if (results.length >= max) break;
     if (round === 0) console.log("Reaction surface snapshot:", JSON.stringify(await reactionSurfaceSnapshot(page)));
+    if (await dialog.count().catch(() => 0) === 0) {
+      const fallback = await visibleReactionSurfaces(page);
+      if (fallback.length) dialog = page.locator('[role="dialog"], [role="listbox"], [role="menu"], [role="list"], [role="tabpanel"], .artdeco-modal, .artdeco-popover, [data-test-modal], [data-test-dialog], [data-test-popover]').nth(fallback[fallback.length - 1].index);
+    }
     if (await dialog.count().catch(() => 0) === 0) break;
     const clickedResults = await captureReactionCandidates(dialog, page, seen, max - results.length);
     results.push(...clickedResults);
@@ -190,7 +210,7 @@ async function collectReactionPeople(page: Page, max: number, warnings: string[]
   }
   if (!results.length) {
     const snapshot = await reactionSurfaceSnapshot(page);
-    warnings.push(`Reaction extraction found no profile URLs. Diagnostic: surfaces=${snapshot.surfaceCount}, pageProfileLinks=${snapshot.profileLinksOnPage}, selectedProfileLinks=${snapshot.selectedProfileLinks ?? 0}, text=${clean(snapshot.text).slice(0, 240)}`);
+    warnings.push(`Reaction extraction found no profile URLs. Diagnostic: surfaces=${snapshot.surfaceCount}, visibleReactionSurfaces=${snapshot.visibleMatches.length}, pageProfileLinks=${snapshot.profileLinksOnPage}, bodyReactionContext=${clean(snapshot.bodyReactionContext).slice(0, 600)}`);
   }
   return results;
 }
