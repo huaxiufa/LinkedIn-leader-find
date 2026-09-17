@@ -1,6 +1,7 @@
 import { chromium } from "playwright";
 import { db } from "../lib/db";
 import { scrapePublicPost } from "../lib/scraper";
+import { scrapeReactions } from "../lib/reaction-scraper";
 import { normalizeLinkedInUrl } from "../lib/normalize";
 
 // Playwright's Browser returned by connectOverCDP exposes close(), not disconnect().
@@ -57,7 +58,28 @@ async function processOne() {
           sessionStatus = "SIGNED_IN";
         }
 
-        for (const item of result.engagements) {
+        let engagements = result.engagements;
+
+        // LinkedIn changes the reaction-count DOM frequently. If the main
+        // scraper could not obtain reactions, use the dedicated reaction path
+        // that targets the exact visible "N reactions" text and its clickable
+        // ancestor inside the post.
+        if (!engagements.some((item) => item.type === "REACTION")) {
+          console.log("Primary reaction extraction returned 0; trying dedicated reaction extractor.");
+          const fallback = await scrapeReactions(postUrl, search.maxEngagersPerPost);
+          if (fallback.reactions.length) {
+            engagements = [...engagements, ...fallback.reactions];
+            // Remove only reaction-extraction warnings from the primary pass
+            // when the fallback successfully recovered the reaction list.
+            for (let i = warnings.length - 1; i >= 0; i--) {
+              if (warnings[i].startsWith(`${postUrl}:`) && /reaction/i.test(warnings[i])) warnings.splice(i, 1);
+            }
+          } else {
+            warnings.push(...fallback.warnings.map((w) => `${postUrl}: ${w}`));
+          }
+        }
+
+        for (const item of engagements) {
           const linkedinUrl = normalizeLinkedInUrl(item.profileUrl);
           if (!linkedinUrl || suppression.has(linkedinUrl)) continue;
 
@@ -104,6 +126,8 @@ async function processOne() {
             },
           });
         }
+
+        console.log(`Total engagement extraction: ${engagements.length} profile(s) captured.`);
       } catch (err) {
         warnings.push(`${postUrl}: ${err instanceof Error ? err.message : "Scrape failed."}`);
       }
