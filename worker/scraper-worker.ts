@@ -1,6 +1,20 @@
+import { chromium } from "playwright";
 import { db } from "../lib/db";
 import { scrapePublicPost } from "../lib/scraper";
 import { normalizeLinkedInUrl } from "../lib/normalize";
+
+// Playwright's Browser returned by connectOverCDP exposes close(), not disconnect().
+// The scraper currently calls disconnect() in its cleanup path. Bridge that call
+// to browser.close(), which disconnects the Playwright CDP client while leaving
+// the externally launched Chrome process running.
+const originalConnectOverCDP = chromium.connectOverCDP.bind(chromium);
+(chromium as any).connectOverCDP = async (...args: any[]) => {
+  const browser = await originalConnectOverCDP(...args);
+  (browser as any).disconnect = () => {
+    void browser.close().catch(() => {});
+  };
+  return browser;
+};
 
 const pollMs = Number(process.env.SCRAPER_POLL_MS ?? 3000);
 
