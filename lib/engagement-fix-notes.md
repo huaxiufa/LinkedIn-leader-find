@@ -1,1 +1,0 @@
-This marker is obsolete; engagement extractor fix is committed in lib/scraper.ts.
