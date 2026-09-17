@@ -1,1 +1,1 @@
-Temporary marker for engagement extractor repair.
+This marker is obsolete; engagement extractor fix is committed in lib/scraper.ts.
