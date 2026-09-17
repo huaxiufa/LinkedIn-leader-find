@@ -17,6 +17,7 @@ export type ScrapeResult = { engagements: ScrapedEngagement[]; warnings: string[
 
 const clean = (v: string | null | undefined) => (v ?? "").replace(/\s+/g, " ").trim();
 const profile = (v: string) => { const u = normalizeLinkedInUrl(v); return /linkedin\.com\/in\//i.test(u) ? u : ""; };
+const genericName = (v: string) => /^(like|comment|repost|send|follow|most relevant|most recent|reactions?|likes?|people who reacted|close|cancel|done|back|next|previous|see all|show more|load more|connections?|grow your network|my network|notifications?|messaging|jobs|home|search|me|for business|celebrate|support|love|insightful|funny)$/i.test(clean(v)) || clean(v).length < 2;
 
 async function connectBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
   const configured = new URL(process.env.LINKEDIN_CDP_URL ?? "http://host.docker.internal:9222");
@@ -41,30 +42,96 @@ async function connectBrowser(): Promise<{ browser: Browser; context: BrowserCon
   return { browser, context, page };
 }
 
-const postRoots = (page: Page) => page.locator('article, [data-urn*="ugcPost"], [data-urn*="activity"], [data-id*="ugcPost"], [data-id*="urn:li:activity"]');
+function postId(postUrl: string) {
+  return postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1] ?? "";
+}
+
+async function findPostRoot(page: Page, postUrl: string): Promise<Locator | null> {
+  const id = postId(postUrl);
+  const selectors: string[] = [];
+  if (id) {
+    selectors.push(`[data-urn*="${id}"], [data-id*="${id}"]`);
+    selectors.push(`[data-urn="urn:li:activity:${id}"], [data-id="urn:li:activity:${id}"]`);
+  }
+  for (const selector of selectors) {
+    const loc = page.locator(selector);
+    const n = Math.min(await loc.count().catch(() => 0), 20);
+    for (let i = 0; i < n; i++) {
+      const candidate = loc.nth(i);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      const article = candidate.locator("xpath=ancestor::article[1]");
+      if (await article.count().catch(() => 0)) return article;
+      return candidate;
+    }
+  }
+  const normalized = normalizeLinkedInUrl(postUrl).replace(/\/$/, "").toLowerCase();
+  const links = page.locator(`a[href*="/posts/"], a[href*="/feed/update/"]`);
+  const n = Math.min(await links.count().catch(() => 0), 100);
+  for (let i = 0; i < n; i++) {
+    const href = normalizeLinkedInUrl((await links.nth(i).getAttribute("href").catch(() => "")) || "").replace(/\/$/, "").toLowerCase();
+    if (href && (href === normalized || href.includes(id))) {
+      const article = links.nth(i).locator("xpath=ancestor::article[1]");
+      if (await article.count().catch(() => 0)) return article;
+    }
+  }
+  const articles = page.locator("article");
+  const ac = Math.min(await articles.count().catch(() => 0), 50);
+  let best: Locator | null = null;
+  let bestScore = 0;
+  for (let i = 0; i < ac; i++) {
+    const a = articles.nth(i);
+    if (!(await a.isVisible().catch(() => false))) continue;
+    const text = clean(await a.innerText().catch(() => ""));
+    let score = 0;
+    if (id && text.includes(id)) score += 3;
+    if (/\bcomments?\b/i.test(text)) score++;
+    if (/\breactions?\b|\blikes?\b/i.test(text)) score++;
+    if (score > bestScore) { bestScore = score; best = a; }
+  }
+  if (best) console.log(`Post root fallback selected with score=${bestScore}.`);
+  return best;
+}
+
+async function diagnosticControls(root: Locator) {
+  const controls = root.locator("button, [role='button'], a");
+  const n = Math.min(await controls.count().catch(() => 0), 120);
+  const hits: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const c = controls.nth(i);
+    if (!(await c.isVisible().catch(() => false))) continue;
+    const label = clean((await c.getAttribute("aria-label").catch(() => "")) || (await c.getAttribute("title").catch(() => "")) || (await c.innerText().catch(() => "")));
+    if (/comment|reaction|like/i.test(label)) hits.push(label.slice(0, 120));
+  }
+  if (hits.length) console.log(`Post interaction controls: ${hits.slice(0, 20).join(" | ")}`);
+}
 
 async function findPostControl(page: Page, kind: "comments" | "reactions", postUrl: string) {
-  const id = postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1] ?? "";
-  const roots: Locator[] = [];
-  if (id) roots.push(page.locator(`[data-urn*="${id}"], [data-id*="${id}"]`).first());
-  const rootsAll = postRoots(page);
-  const count = Math.min(await rootsAll.count().catch(() => 0), 30);
-  for (let i = 0; i < count; i++) roots.push(rootsAll.nth(i));
-  const exact = kind === "comments" ? /^\d+\s+comments?$/i : /^\d+\s+(?:reactions?|likes?)$/i;
-  for (const root of roots) {
-    if (!(await root.count().catch(() => 0)) || !(await root.isVisible().catch(() => false))) continue;
-    const node = root.getByText(exact).first();
-    if (!(await node.count().catch(() => 0)) || !(await node.isVisible().catch(() => false))) continue;
-    const clickable = node.locator("xpath=ancestor::*[self::button or @role='button' or self::a or @tabindex='0'][1]");
-    return (await clickable.count().catch(() => 0)) ? clickable : node;
+  const root = await findPostRoot(page, postUrl);
+  if (!root) { console.log(`Could not identify post root for ${kind}.`); return null; }
+  await diagnosticControls(root);
+  const countPattern = kind === "comments" ? /^\d[\d,.]*\s+comments?$/i : /^\d[\d,.]*\s+(?:reactions?|likes?)$/i;
+  const labelPattern = kind === "comments" ? /comment/i : /reaction|like/i;
+  const candidates = root.locator("button, [role='button'], a, [tabindex='0']");
+  const n = Math.min(await candidates.count().catch(() => 0), 200);
+  for (let i = 0; i < n; i++) {
+    const c = candidates.nth(i);
+    if (!(await c.isVisible().catch(() => false))) continue;
+    const text = clean(await c.innerText().catch(() => ""));
+    const aria = clean(await c.getAttribute("aria-label").catch(() => ""));
+    const title = clean(await c.getAttribute("title").catch(() => ""));
+    const data = clean(await c.getAttribute("data-view-name").catch(() => ""));
+    const combined = `${text} ${aria} ${title} ${data}`;
+    if (countPattern.test(text) || countPattern.test(aria) || countPattern.test(title)) return c;
+    if (labelPattern.test(combined) && !/reply|follow|my network|notification|messaging/i.test(combined)) return c;
   }
+  console.log(`No ${kind} control found inside identified post root.`);
   return null;
 }
 
 async function openComments(page: Page, postUrl: string) {
   const trigger = await findPostControl(page, "comments", postUrl);
   if (!trigger) return false;
-  console.log("Comment count control found; clicking the post's comment count.");
+  console.log("Comment interaction control found; clicking it.");
   await trigger.scrollIntoViewIfNeeded().catch(() => {});
   await trigger.click({ timeout: 5000 }).catch(async () => trigger.click({ timeout: 5000, force: true }));
   await page.waitForTimeout(1000);
@@ -72,9 +139,7 @@ async function openComments(page: Page, postUrl: string) {
 }
 
 const commentContainers = [
-  '.comments-comment-item',
   '[class*="comments-comment-item"]',
-  '[class*="comments-comment"]',
   '[data-view-name*="comment"]',
   '[data-test-id*="comment"]',
   '[data-testid*="comment"]',
@@ -84,36 +149,39 @@ const commentContainers = [
 ].join(', ');
 
 const commentTextSelectors = [
-  '.comments-comment-item__main-content',
-  '.comments-comment-item__inline-show-more-text',
-  '.comments-comment-item__comment-text',
-  '.comments-comment-item__text-wrapper',
   '[class*="comment-item__main-content"]',
   '[class*="comment-item__inline-show-more-text"]',
+  '[class*="comment-item__comment-text"]',
   '[class*="comment-text"]',
   '[data-view-name*="comment"] [dir="auto"]'
 ].join(', ');
 
 async function expandComments(page: Page) {
-  for (let round = 0; round < 10; round++) {
-    const buttons = page.getByRole("button", { name: /load more comments|show more comments|view more comments|previous comments/i });
-    const n = await buttons.count().catch(() => 0);
+  for (let round = 0; round < 12; round++) {
+    const buttons = page.locator("button, [role='button']");
+    const n = Math.min(await buttons.count().catch(() => 0), 200);
     let clicked = false;
     for (let i = 0; i < n; i++) {
       const b = buttons.nth(i);
-      if (await b.isVisible().catch(() => false)) { await b.click({ timeout: 3000 }).catch(() => {}); await page.waitForTimeout(500); clicked = true; break; }
+      if (!(await b.isVisible().catch(() => false))) continue;
+      const label = clean((await b.getAttribute("aria-label").catch(() => "")) || (await b.innerText().catch(() => "")));
+      if (/load more comments|show more comments|view more comments|previous comments|more comments/i.test(label)) {
+        await b.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        clicked = true;
+        break;
+      }
     }
     if (!clicked) break;
   }
 }
 
-function nearestComment(anchor: Locator) {
+function nearestStrongComment(anchor: Locator) {
   return anchor.locator(`xpath=ancestor::*[${[
     'contains(@class,"comments-comment-item")',
-    'contains(@class,"comments-comment")',
     'contains(@class,"comment-item")',
-    'contains(@data-id,"comment")',
     'contains(@data-urn,"comment")',
+    'contains(@data-id,"comment")',
     'contains(@data-test-id,"comment")',
     'contains(@data-testid,"comment")'
   ].join(" or ")}][1]`);
@@ -123,7 +191,7 @@ async function commentText(container: Locator, name: string) {
   const bodies = container.locator(commentTextSelectors);
   for (let i = 0, n = Math.min(await bodies.count().catch(() => 0), 20); i < n; i++) {
     const text = clean(await bodies.nth(i).innerText().catch(() => ""));
-    if (text && text.toLowerCase() !== name.toLowerCase()) return text.slice(0, 5000);
+    if (text && text.toLowerCase() !== name.toLowerCase() && !/^(like|reply|follow|edited|see more|see less|translate)$/i.test(text)) return text.slice(0, 5000);
   }
   const lines = (await container.innerText().catch(() => "")).split(/\n+/).map(clean).filter(Boolean);
   const idx = lines.findIndex((x) => x.toLowerCase() === name.toLowerCase());
@@ -134,59 +202,63 @@ async function commentText(container: Locator, name: string) {
   return "";
 }
 
-async function collectComments(page: Page, max: number) {
+function commentSurface(page: Page) {
+  return page.locator('[role="dialog"], [role="tabpanel"], .artdeco-modal, [data-test-modal], [data-test-dialog]').filter({ hasText: /comment|reply/i }).last();
+}
+
+async function collectComments(page: Page, max: number, postUrl: string) {
   const seen = new Set<string>();
   const out: ScrapedEngagement[] = [];
-  const opened = await openComments(page, page.url());
-  if (!opened) console.log("Comment count control was not found; checking already-visible comment containers.");
+  const opened = await openComments(page, postUrl);
+  if (!opened) console.log("Comment control was not found; checking strongly-marked comment containers already in the DOM.");
   await expandComments(page);
-
-  const containers = page.locator(commentContainers);
+  const surface = commentSurface(page);
+  const scope = await surface.count().catch(() => 0) ? surface : page.locator(await findPostRoot(page, postUrl) ?? "article").first();
+  const containers = scope.locator(commentContainers);
   const n = Math.min(await containers.count().catch(() => 0), Math.max(max * 5, 200));
-  let profileAnchors = 0;
+  let anchorsFound = 0;
   for (let i = 0; i < n && out.length < max; i++) {
     const container = containers.nth(i);
     if (!(await container.isVisible().catch(() => false))) continue;
     const text = clean(await container.innerText().catch(() => ""));
     if (!/\breply\b/i.test(text)) continue;
     const anchors = container.locator('a[href*="/in/"], a[data-profile-url], a[data-test-profile-url]');
-    const an = Math.min(await anchors.count().catch(() => 0), 5);
-    profileAnchors += an;
+    const an = Math.min(await anchors.count().catch(() => 0), 8);
+    anchorsFound += an;
     for (let j = 0; j < an && out.length < max; j++) {
       const a = anchors.nth(j);
       const href = profile((await a.getAttribute("href").catch(() => "")) || (await a.getAttribute("data-profile-url").catch(() => "")) || (await a.getAttribute("data-test-profile-url").catch(() => "")) || "");
       const name = clean((await a.textContent().catch(() => "")) || (await a.getAttribute("aria-label").catch(() => "")));
-      if (!href || !name || seen.has(href.toLowerCase())) continue;
-      const textValue = await commentText(container, name);
-      if (!textValue) continue;
+      if (!href || !name || genericName(name) || seen.has(href.toLowerCase())) continue;
+      const body = await commentText(container, name);
+      if (!body) continue;
       seen.add(href.toLowerCase());
-      out.push({ profileUrl: href, name, type: "COMMENT", commentText: textValue });
-      break;
+      out.push({ profileUrl: href, name, type: "COMMENT", commentText: body });
     }
   }
-
-  // Layout fallback: only accept a profile when its nearest comment-like ancestor
-  // explicitly contains Reply and real comment text. Never use page-wide /in/ links.
+  // Strict fallback: page-wide anchors are allowed only if their nearest ancestor
+  // has an explicit comment marker. This prevents unrelated people on the page
+  // from becoming fake commenters.
   if (out.length < max) {
     const anchors = page.locator('a[href*="/in/"], a[data-profile-url], a[data-test-profile-url]');
-    const an = Math.min(await anchors.count().catch(() => 0), max * 10);
-    let fallbackCandidates = 0;
+    const an = Math.min(await anchors.count().catch(() => 0), max * 12);
+    let fallback = 0;
     for (let i = 0; i < an && out.length < max; i++) {
       const a = anchors.nth(i);
       const href = profile((await a.getAttribute("href").catch(() => "")) || (await a.getAttribute("data-profile-url").catch(() => "")) || (await a.getAttribute("data-test-profile-url").catch(() => "")) || "");
       const name = clean((await a.textContent().catch(() => "")) || (await a.getAttribute("aria-label").catch(() => "")));
-      if (!href || !name || seen.has(href.toLowerCase())) continue;
-      const candidate = nearestComment(a);
+      if (!href || !name || genericName(name) || seen.has(href.toLowerCase())) continue;
+      const candidate = nearestStrongComment(a);
       if (!(await candidate.count().catch(() => 0))) continue;
       const candidateText = clean(await candidate.innerText().catch(() => ""));
       if (!/\breply\b/i.test(candidateText)) continue;
-      fallbackCandidates++;
-      const textValue = await commentText(candidate, name);
-      if (!textValue) continue;
+      const body = await commentText(candidate, name);
+      if (!body) continue;
+      fallback++;
       seen.add(href.toLowerCase());
-      out.push({ profileUrl: href, name, type: "COMMENT", commentText: textValue });
+      out.push({ profileUrl: href, name, type: "COMMENT", commentText: body });
     }
-    console.log(`Comment diagnostics: containers=${n}, profileAnchors=${profileAnchors}, fallbackCandidates=${fallbackCandidates}`);
+    console.log(`Comment diagnostics: containers=${n}, profileAnchors=${anchorsFound}, strictFallback=${fallback}`);
   }
   console.log(`Comment container extraction: ${out.length} real comment(s) captured.`);
   return out;
@@ -200,14 +272,17 @@ async function collectReactions(page: Page, max: number, warnings: string[], pos
   const out: ScrapedEngagement[] = [];
   const seen = new Set<string>();
   const trigger = await findPostControl(page, "reactions", postUrl);
-  if (!trigger) { warnings.push("Could not locate the reaction count control inside the LinkedIn post."); return out; }
-  console.log("Reaction control found; clicking the post's reaction count.");
+  if (!trigger) { warnings.push("Could not locate the reaction interaction control inside the LinkedIn post."); return out; }
+  console.log("Reaction interaction control found; clicking it.");
   await trigger.scrollIntoViewIfNeeded().catch(() => {});
   await trigger.click({ timeout: 5000 }).catch(async () => trigger.click({ timeout: 5000, force: true }));
   await page.waitForTimeout(1000);
-  for (let round = 0; round < 40 && out.length < max; round++) {
+  for (let round = 0; round < 50 && out.length < max; round++) {
     const surface = reactionSurface(page);
-    if (!(await surface.count().catch(() => 0))) break;
+    if (!(await surface.count().catch(() => 0))) {
+      if (round === 0) console.log("Reaction surface not detected after click; no page-wide profile fallback will be used.");
+      break;
+    }
     const anchors = surface.locator('a[href*="/in/"], a[data-profile-url], a[data-test-profile-url]');
     const n = Math.min(await anchors.count().catch(() => 0), 1000);
     for (let i = 0; i < n && out.length < max; i++) {
@@ -215,7 +290,7 @@ async function collectReactions(page: Page, max: number, warnings: string[], pos
       if (!(await a.isVisible().catch(() => false))) continue;
       const href = profile((await a.getAttribute("href").catch(() => "")) || (await a.getAttribute("data-profile-url").catch(() => "")) || (await a.getAttribute("data-test-profile-url").catch(() => "")) || "");
       const name = clean((await a.textContent().catch(() => "")) || (await a.getAttribute("aria-label").catch(() => "")));
-      if (!href || !name || seen.has(href.toLowerCase()) || /^(reactions?|likes?|people who reacted|close|all)$/i.test(name)) continue;
+      if (!href || !name || genericName(name) || seen.has(href.toLowerCase())) continue;
       seen.add(href.toLowerCase());
       out.push({ profileUrl: href, name, type: "REACTION", reactionType: "UNKNOWN" });
     }
@@ -239,16 +314,12 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
   const { browser, page } = await connectBrowser();
   try {
     await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1800);
     const signedOut = await page.locator('input[name="session_key"], form[action*="login"]').count().catch(() => 0);
     console.log(`LinkedIn session: ${signedOut ? "SIGNED OUT" : "SIGNED IN"}`);
     if (signedOut) warnings.push("LinkedIn appears to be signed out in the connected Chrome profile.");
-
-    const comments = await collectComments(page, maxComments);
+    const comments = await collectComments(page, maxComments, postUrl);
     const reactions = await collectReactions(page, maxReactions, warnings, postUrl);
-
-    // Dedupe within this post. If somebody both commented and reacted, the
-    // comment is the primary engagement and retains its comment text.
     const merged = new Map<string, ScrapedEngagement>();
     for (const item of [...reactions, ...comments]) {
       const key = normalizeLinkedInUrl(item.profileUrl).toLowerCase();
