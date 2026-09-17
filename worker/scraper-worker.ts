@@ -7,27 +7,67 @@ import { normalizeLinkedInUrl } from "../lib/normalize";
 // Playwright's Browser returned by connectOverCDP exposes close(), not disconnect().
 // The scraper currently calls disconnect() in its cleanup path. Bridge that call
 // to browser.close(), which disconnects the Playwright CDP client while leaving
-// the externally launched Chrome process running. Also normalize the browser
-// WebSocket URL to the HTTP CDP endpoint: this avoids cases where the WebSocket
-// handshake succeeds but Playwright's CDP initialization stalls inside Docker.
+// the externally launched Chrome process running.
 const originalConnectOverCDP = chromium.connectOverCDP.bind(chromium);
 (chromium as any).connectOverCDP = async (...args: any[]) => {
-  if (typeof args[0] === "string" && args[0].startsWith("ws://")) {
+  const configuredEndpoint = String(args[0] ?? "http://host.docker.internal:9222");
+  let endpoint = configuredEndpoint;
+
+  if (configuredEndpoint.startsWith("ws://") || configuredEndpoint.startsWith("wss://")) {
     try {
-      const ws = new URL(args[0]);
-      args[0] = `http://${ws.hostname}:${ws.port || "9222"}`;
-      console.log(`Normalizing Chrome CDP WebSocket endpoint to ${args[0]}`);
+      const ws = new URL(configuredEndpoint);
+      endpoint = `http://${ws.hostname}:${ws.port || "9222"}`;
     } catch {
-      // Leave the original endpoint untouched if it is not a parseable URL.
+      endpoint = configuredEndpoint;
     }
   }
-  if (!args[1] || typeof args[1] !== "object") args[1] = {};
-  args[1] = { ...args[1], timeout: Math.max(Number(args[1].timeout ?? 0), 90000) };
-  const browser = await originalConnectOverCDP(...args);
-  (browser as any).disconnect = () => {
-    void browser.close().catch(() => {});
-  };
-  return browser;
+
+  if (endpoint.startsWith("http://") || endpoint.startsWith("https://")) {
+    console.log(`Chrome CDP connection endpoint: ${endpoint}`);
+  }
+
+  // A Chrome CDP websocket can occasionally accept the TCP/WebSocket connection
+  // but stall during Playwright's CDP initialization. Treat that as transient:
+  // refresh /json/version and retry instead of asking the user to restart Chrome.
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      let connectEndpoint = endpoint;
+      try {
+        const versionResponse = await fetch(`${endpoint}/json/version`, {
+          headers: { Host: new URL(endpoint).hostname },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!versionResponse.ok) throw new Error(`Chrome CDP returned HTTP ${versionResponse.status}.`);
+        const version = await versionResponse.json() as { Browser?: string; webSocketDebuggerUrl?: string };
+        if (version.Browser) console.log(`Chrome CDP browser: ${version.Browser}`);
+        // Prefer the fresh browser endpoint from Chrome, but connect through the
+        // HTTP CDP endpoint. Playwright will retrieve the current websocket URL.
+        if (version.webSocketDebuggerUrl) {
+          connectEndpoint = endpoint;
+        }
+      } catch (err) {
+        lastError = err;
+        throw err;
+      }
+
+      const options = { ...(args[1] ?? {}), timeout: 20000 };
+      const browser = await originalConnectOverCDP(connectEndpoint, options);
+      (browser as any).disconnect = () => {
+        void browser.close().catch(() => {});
+      };
+      if (attempt > 1) console.log(`Chrome CDP recovered on connection attempt ${attempt}.`);
+      return browser;
+    } catch (err) {
+      lastError = err;
+      console.warn(`Chrome CDP connection attempt ${attempt}/5 failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (attempt < 5) {
+        await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Could not connect to Chrome over CDP after 5 attempts.");
 };
 
 const pollMs = Number(process.env.SCRAPER_POLL_MS ?? 3000);
