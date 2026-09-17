@@ -6,9 +6,22 @@ import { normalizeLinkedInUrl } from "../lib/normalize";
 // Playwright's Browser returned by connectOverCDP exposes close(), not disconnect().
 // The scraper currently calls disconnect() in its cleanup path. Bridge that call
 // to browser.close(), which disconnects the Playwright CDP client while leaving
-// the externally launched Chrome process running.
+// the externally launched Chrome process running. Also normalize the browser
+// WebSocket URL to the HTTP CDP endpoint: this avoids cases where the WebSocket
+// handshake succeeds but Playwright's CDP initialization stalls inside Docker.
 const originalConnectOverCDP = chromium.connectOverCDP.bind(chromium);
 (chromium as any).connectOverCDP = async (...args: any[]) => {
+  if (typeof args[0] === "string" && args[0].startsWith("ws://")) {
+    try {
+      const ws = new URL(args[0]);
+      args[0] = `http://${ws.hostname}:${ws.port || "9222"}`;
+      console.log(`Normalizing Chrome CDP WebSocket endpoint to ${args[0]}`);
+    } catch {
+      // Leave the original endpoint untouched if it is not a parseable URL.
+    }
+  }
+  if (!args[1] || typeof args[1] !== "object") args[1] = {};
+  args[1] = { ...args[1], timeout: Math.max(Number(args[1].timeout ?? 0), 90000) };
   const browser = await originalConnectOverCDP(...args);
   (browser as any).disconnect = () => {
     void browser.close().catch(() => {});
