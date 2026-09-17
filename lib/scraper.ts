@@ -42,7 +42,9 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   return { browser, context, page };
 }
 
-function profileRow(anchor: Locator) { return anchor.locator("xpath=ancestor::*[self::li or @role='listitem' or self::article][1]"); }
+function profileRow(anchor: Locator) {
+  return anchor.locator("xpath=ancestor::*[self::li or @role='listitem' or self::article][1]");
+}
 
 async function collectProfileLinks(scope: Locator, seen: Set<string>, type: "COMMENT" | "REACTION", limit: number) {
   const anchors = scope.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
@@ -50,14 +52,26 @@ async function collectProfileLinks(scope: Locator, seen: Set<string>, type: "COM
   const result: ScrapedEngagement[] = [];
   for (let i = 0; i < count && result.length < limit; i++) {
     const anchor = anchors.nth(i);
-    const href = normalizeLinkedInUrl((await anchor.getAttribute("href").catch(() => "")) || (await anchor.getAttribute("data-test-profile-url").catch(() => "")) || (await anchor.getAttribute("data-profile-url").catch(() => "")) || "");
+    const href = normalizeLinkedInUrl(
+      (await anchor.getAttribute("href").catch(() => "")) ||
+      (await anchor.getAttribute("data-test-profile-url").catch(() => "")) ||
+      (await anchor.getAttribute("data-profile-url").catch(() => "")) || ""
+    );
     if (!isProfileUrl(href) || seen.has(href.toLowerCase())) continue;
     const name = clean((await anchor.textContent().catch(() => "")) || (await anchor.getAttribute("aria-label").catch(() => "")));
     const row = profileRow(anchor);
     const rowText = clean(await row.textContent().catch(() => ""));
     const headline = name && rowText.startsWith(name) ? clean(rowText.slice(name.length)) : "";
     seen.add(href.toLowerCase());
-    result.push({ profileUrl: href, name: name || href.split("/in/")[1]?.replace(/\/?$/, "") || "LinkedIn member", headline: headline || undefined, jobTitle: headline || undefined, type, reactionType: type === "REACTION" ? "UNKNOWN" : undefined, commentText: type === "COMMENT" ? rowText.slice(0, 5000) : undefined });
+    result.push({
+      profileUrl: href,
+      name: name || href.split("/in/")[1]?.replace(/\/?$/, "") || "LinkedIn member",
+      headline: headline || undefined,
+      jobTitle: headline || undefined,
+      type,
+      reactionType: type === "REACTION" ? "UNKNOWN" : undefined,
+      commentText: type === "COMMENT" ? rowText.slice(0, 5000) : undefined,
+    });
   }
   return result;
 }
@@ -80,13 +94,13 @@ async function reactionSurfaceSnapshot(page: Page) {
     const links = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
     visibleMatches.push({ index: i, links, text: text.slice(0, 600) });
   }
-  return { url: page.url(), surfaceCount: count, visibleMatches, profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0), bodyReactionContext: clean(await page.locator("body").innerText().catch(() => "")).slice(0, 1800) };
-}
-
-async function closeTransientProfile(page: Page) {
-  const buttons = page.getByRole("button", { name: /close/i });
-  const count = await buttons.count().catch(() => 0);
-  if (count) await buttons.last().click({ timeout: 1200 }).catch(() => {});
+  return {
+    url: page.url(),
+    surfaceCount: count,
+    visibleMatches,
+    profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0),
+    bodyReactionContext: clean(await page.locator("body").innerText().catch(() => "")).slice(0, 1800),
+  };
 }
 
 async function scrollReactionDialog(dialog: Locator, page: Page) {
@@ -108,8 +122,6 @@ async function scrollReactionDialog(dialog: Locator, page: Page) {
 }
 
 async function findReactionTrigger(page: Page) {
-  // Prefer the engagement control inside the actual post rather than any global
-  // "reactions"/"likes" text from the navigation, notifications, or My Network UI.
   const postCandidates = page.locator('article, [data-urn*="activity"], [data-id*="urn:li:activity"], [data-urn*="ugcPost"], [data-id*="ugcPost"]');
   const postCount = Math.min(await postCandidates.count().catch(() => 0), 30);
   for (let i = 0; i < postCount; i++) {
@@ -126,8 +138,6 @@ async function findReactionTrigger(page: Page) {
     }
   }
 
-  // Fallback: search visible controls by reaction-count wording, but reject
-  // navigation controls such as "Connections" and "My Network".
   const controls = page.locator('button, [role="button"], a');
   const count = Math.min(await controls.count().catch(() => 0), 2000);
   for (let i = 0; i < count; i++) {
@@ -148,8 +158,6 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
   results.push(...direct);
   if (results.length >= max) return results;
 
-  // Some LinkedIn reaction lists expose names as buttons/accessible links first,
-  // with the actual /in/ URL only after the name is clicked.
   const candidates = dialog.locator('a, [role="link"], button, [role="button"], [tabindex="0"], [data-control-name], [data-view-name], span.hoverable-link-text, [class*="hoverable-link-text"]');
   const count = Math.min(await candidates.count().catch(() => 0), 3000);
   const visitedLabels = new Set<string>();
@@ -159,11 +167,15 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
     if (!label || label.length < 2 || label.length > 140 || visitedLabels.has(label)) continue;
     if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all|people who reacted|button|link|tab|menuitem|listitem|all|celebrate|support|love|insightful|funny)$/i.test(label)) continue;
     visitedLabels.add(label);
-    const href = normalizeLinkedInUrl((await candidate.getAttribute("href").catch(() => "")) || (await candidate.getAttribute("data-href").catch(() => "")) || (await candidate.getAttribute("data-profile-url").catch(() => "")) || (await candidate.getAttribute("data-test-profile-url").catch(() => "")) || "");
+    const href = normalizeLinkedInUrl(
+      (await candidate.getAttribute("href").catch(() => "")) ||
+      (await candidate.getAttribute("data-href").catch(() => "")) ||
+      (await candidate.getAttribute("data-profile-url").catch(() => "")) ||
+      (await candidate.getAttribute("data-test-profile-url").catch(() => "")) || ""
+    );
     if (isProfileUrl(href) && !seen.has(href.toLowerCase())) {
       seen.add(href.toLowerCase());
       results.push({ profileUrl: href, name: label, type: "REACTION", reactionType: "UNKNOWN" });
-      continue;
     }
   }
   return results;
@@ -189,7 +201,6 @@ async function collectReactionPeople(page: Page, max: number, warnings: string[]
     const snapshot = await reactionSurfaceSnapshot(page);
     if (round === 0) console.log("Reaction surface snapshot:", JSON.stringify(snapshot));
     if (await dialog.count().catch(() => 0) === 0) {
-      // Do not treat the normal page / My Network surface as a reaction dialog.
       if (page.url() !== beforeUrl && !isProfileUrl(page.url())) await page.goBack({ waitUntil: "domcontentloaded", timeout: 9000 }).catch(() => {});
       warnings.push(`Reaction count was clicked, but LinkedIn did not expose a reaction list surface. Diagnostic: surfaces=${snapshot.surfaceCount}, visibleSurfaces=${snapshot.visibleMatches.length}, pageProfileLinks=${snapshot.profileLinksOnPage}`);
       break;
@@ -209,23 +220,96 @@ async function collectReactionPeople(page: Page, max: number, warnings: string[]
   return results;
 }
 
+const commentContainerSelector = [
+  '.comments-comment-item',
+  '[class*="comments-comment-item"]',
+  '[data-view-name*="comment"]',
+  '[data-testid*="comment"]',
+  'li[class*="comment"]',
+].join(', ');
+
+const commentTextSelector = [
+  '.comments-comment-item__main-content',
+  '.comments-comment-item__inline-show-more-text',
+  '.comments-comment-item__comment-text',
+  '[class*="comment-item__main-content"]',
+  '[class*="comment-item__inline-show-more-text"]',
+  '[class*="comment-text"]',
+].join(', ');
+
+async function extractCommentText(container: Locator, name: string) {
+  const body = container.locator(commentTextSelector);
+  const bodyCount = Math.min(await body.count().catch(() => 0), 10);
+  for (let i = 0; i < bodyCount; i++) {
+    const text = clean(await body.nth(i).innerText().catch(() => ""));
+    if (text && text.length > 1 && text.toLowerCase() !== name.toLowerCase()) return text.slice(0, 5000);
+  }
+
+  const fullText = clean(await container.innerText().catch(() => ""));
+  if (!fullText) return "";
+  const lines = fullText.split(/\n+/).map(clean).filter(Boolean);
+  const nameIndex = lines.findIndex((line) => line.toLowerCase() === name.toLowerCase());
+  if (nameIndex >= 0) {
+    const candidates = lines.slice(nameIndex + 1).filter((line) => !/^(like|reply|follow|edited|see more|see less)$/i.test(line));
+    if (candidates.length) return candidates.join(" ").slice(0, 5000);
+  }
+  return "";
+}
+
 async function collectComments(page: Page, max: number) {
   const seen = new Set<string>();
   const results: ScrapedEngagement[] = [];
-  const anchors = page.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
-  const count = Math.min(await anchors.count().catch(() => 0), max * 5);
-  for (let i = 0; i < count && results.length < max; i++) {
-    const anchor = anchors.nth(i);
-    const href = normalizeLinkedInUrl((await anchor.getAttribute("href").catch(() => "")) || (await anchor.getAttribute("data-test-profile-url").catch(() => "")) || (await anchor.getAttribute("data-profile-url").catch(() => "")) || "");
-    if (!isProfileUrl(href) || seen.has(href.toLowerCase())) continue;
-    const row = profileRow(anchor);
-    const name = clean((await anchor.textContent().catch(() => "")) || (await anchor.getAttribute("aria-label").catch(() => "")));
-    const rowText = clean(await row.textContent().catch(() => ""));
+  const containers = page.locator(commentContainerSelector);
+  const containerCount = Math.min(await containers.count().catch(() => 0), max * 3);
+
+  for (let i = 0; i < containerCount && results.length < max; i++) {
+    const container = containers.nth(i);
+    if (!(await container.isVisible().catch(() => false))) continue;
+
+    const anchors = container.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
+    const anchorCount = Math.min(await anchors.count().catch(() => 0), 10);
+    if (!anchorCount) continue;
+
+    let selected: Locator | null = null;
+    let href = "";
+    for (let j = 0; j < anchorCount; j++) {
+      const anchor = anchors.nth(j);
+      const candidateHref = normalizeLinkedInUrl(
+        (await anchor.getAttribute("href").catch(() => "")) ||
+        (await anchor.getAttribute("data-test-profile-url").catch(() => "")) ||
+        (await anchor.getAttribute("data-profile-url").catch(() => "")) || ""
+      );
+      if (isProfileUrl(candidateHref)) {
+        selected = anchor;
+        href = candidateHref;
+        break;
+      }
+    }
+    if (!selected || !href || seen.has(href.toLowerCase())) continue;
+
+    const name = clean((await selected.textContent().catch(() => "")) || (await selected.getAttribute("aria-label").catch(() => "")));
     if (!name) continue;
-    const headline = rowText.startsWith(name) ? clean(rowText.slice(name.length)) : "";
+
+    const commentText = await extractCommentText(container, name);
+    if (!commentText) {
+      console.log(`Comment candidate skipped because no comment text was found for ${name}.`);
+      continue;
+    }
+
+    const containerText = clean(await container.innerText().catch(() => ""));
+    const headline = containerText.startsWith(name) ? clean(containerText.slice(name.length)) : "";
     seen.add(href.toLowerCase());
-    results.push({ profileUrl: href, name, headline: headline || undefined, jobTitle: headline || undefined, type: "COMMENT", commentText: rowText.slice(0, 5000) });
+    results.push({
+      profileUrl: href,
+      name,
+      headline: headline || undefined,
+      jobTitle: headline || undefined,
+      type: "COMMENT",
+      commentText,
+    });
   }
+
+  console.log(`Comment container extraction: ${results.length} real comment(s) captured.`);
   return results;
 }
 
