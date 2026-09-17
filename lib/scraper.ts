@@ -34,9 +34,6 @@ async function connectToLinkedInBrowser(): Promise<{ browser: Browser; context: 
   const version = await response.json() as { Browser?: string; webSocketDebuggerUrl?: string };
   console.log(`Chrome CDP browser: ${version.Browser ?? "unknown"}`);
   if (!version.webSocketDebuggerUrl) throw new Error("Chrome CDP did not return a browser WebSocket endpoint.");
-
-  // Connect directly to Chrome's browser WebSocket endpoint. This avoids the
-  // HTTP /json/version handshake that can hang when Docker reaches Windows Chrome.
   const browser = await chromium.connectOverCDP(version.webSocketDebuggerUrl, { timeout: 30000 });
   const context = browser.contexts()[0];
   if (!context) throw new Error("Chrome CDP connected, but no browser context is available.");
@@ -69,7 +66,7 @@ async function collectProfileLinks(scope: Locator, seen: Set<string>, type: "COM
 
 function reactionDialog(page: Page) {
   const dialogs = page.locator('[role="dialog"], .artdeco-modal, [data-test-modal], [data-test-dialog]');
-  return dialogs.filter({ hasText: /reactions?|people who reacted|likes?/i }).first();
+  return dialogs.filter({ hasText: /people who reacted|reactions?|likes?/i }).last();
 }
 
 async function reactionSurfaceSnapshot(page: Page) {
@@ -78,11 +75,13 @@ async function reactionSurfaceSnapshot(page: Page) {
   let best: Locator | null = null;
   let bestScore = -1;
   let bestText = "";
+  let bestLinks = 0;
   for (let i = 0; i < count; i++) {
     const candidate = dialogs.nth(i);
     const text = clean(await candidate.innerText().catch(() => ""));
-    const score = (text.match(/reaction|people who reacted|likes?/gi) || []).length * 10000 + text.length;
-    if (score > bestScore) { bestScore = score; best = candidate; bestText = text; }
+    const links = await candidate.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]').count().catch(() => 0);
+    const score = links * 100000 + (text.match(/people who reacted|reactions?|likes?/gi) || []).length * 1000 + text.length;
+    if (score > bestScore) { bestScore = score; best = candidate; bestText = text; bestLinks = links; }
   }
   if (!best) return { url: page.url(), surfaceCount: count, text: "", links: [], clickable: [], profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0) };
   const linksLocator = best.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
@@ -92,7 +91,7 @@ async function reactionSurfaceSnapshot(page: Page) {
     const link = linksLocator.nth(i);
     links.push({ href: normalizeLinkedInUrl(await link.getAttribute("href").catch(() => "") || ""), text: clean(await link.textContent().catch(() => "")), aria: clean(await link.getAttribute("aria-label").catch(() => "")) });
   }
-  return { url: page.url(), surfaceCount: count, text: bestText.slice(0, 5000), links, clickable: [], profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0) };
+  return { url: page.url(), surfaceCount: count, text: bestText.slice(0, 5000), links, clickable: [], profileLinksOnPage: await page.locator('a[href*="/in/"]').count().catch(() => 0), selectedProfileLinks: bestLinks };
 }
 
 async function closeTransientProfile(page: Page) {
@@ -119,6 +118,58 @@ async function scrollReactionDialog(dialog: Locator, page: Page) {
   return false;
 }
 
+async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<string>, max: number) {
+  const results: ScrapedEngagement[] = [];
+  const candidates = dialog.locator('a, [role="link"], button, [role="button"], [tabindex="0"], [data-control-name], [data-view-name], [data-test-id], span[dir="ltr"], span.hoverable-link-text, [class*="hoverable-link-text"]');
+  const count = Math.min(await candidates.count().catch(() => 0), 4000);
+  const visitedLabels = new Set<string>();
+  for (let i = 0; i < count && results.length < max; i++) {
+    const candidate = candidates.nth(i);
+    const label = clean((await candidate.textContent().catch(() => "")) || (await candidate.getAttribute("aria-label").catch(() => "")) || (await candidate.getAttribute("title").catch(() => "")));
+    const href = normalizeLinkedInUrl((await candidate.getAttribute("href").catch(() => "")) || (await candidate.getAttribute("data-href").catch(() => "")) || (await candidate.getAttribute("data-profile-url").catch(() => "")) || (await candidate.getAttribute("data-test-profile-url").catch(() => "")) || "");
+    if (!label || label.length < 2 || label.length > 140 || visitedLabels.has(label)) continue;
+    if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all|people who reacted|button|link|tab|menuitem|listitem|all|celebrate|support|love|insightful|funny)$/i.test(label)) continue;
+    visitedLabels.add(label);
+    if (isProfileUrl(href) && !seen.has(href.toLowerCase())) {
+      seen.add(href.toLowerCase());
+      results.push({ profileUrl: href, name: label, type: "REACTION", reactionType: "UNKNOWN" });
+      continue;
+    }
+
+    // LinkedIn sometimes renders reaction users as clickable text without an href.
+    // Clicking that visible user entry can open a profile preview containing a real /in/ URL.
+    const beforePages = page.context().pages();
+    const beforeUrl = page.url();
+    try {
+      await candidate.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {});
+      const popupPromise = page.waitForEvent("popup", { timeout: 700 }).catch(() => undefined);
+      await candidate.click({ timeout: 1800, force: false }).catch(async () => candidate.click({ timeout: 1000, force: true }));
+      const popup = await popupPromise;
+      await page.waitForTimeout(600);
+      const pagesNow = page.context().pages();
+      const newPage = pagesNow.find(p => !beforePages.includes(p) && !p.isClosed());
+      const target = popup && !popup.isClosed() ? popup : (newPage ?? page);
+      const targetUrl = normalizeLinkedInUrl(target.url());
+      if (isProfileUrl(targetUrl) && !seen.has(targetUrl.toLowerCase())) {
+        seen.add(targetUrl.toLowerCase());
+        results.push({ profileUrl: targetUrl, name: label, type: "REACTION", reactionType: "UNKNOWN" });
+        console.log(`Captured reaction profile URL by click: ${targetUrl}`);
+      } else {
+        const found = await collectProfileLinks(target.locator("body"), seen, "REACTION", max - results.length);
+        results.push(...found);
+      }
+      if (popup && !popup.isClosed()) await popup.close().catch(() => {});
+      if (newPage && !newPage.isClosed()) await newPage.close().catch(() => {});
+      if (target === page && page.url() !== beforeUrl && !isProfileUrl(page.url())) {
+        await page.goBack({ waitUntil: "domcontentloaded", timeout: 9000 }).catch(() => {});
+        await page.waitForTimeout(400);
+      }
+      await closeTransientProfile(page);
+    } catch { }
+  }
+  return results;
+}
+
 async function collectReactionPeople(page: Page, max: number, warnings: string[]) {
   const seen = new Set<string>();
   const results: ScrapedEngagement[] = [];
@@ -129,47 +180,17 @@ async function collectReactionPeople(page: Page, max: number, warnings: string[]
     if (results.length >= max) break;
     if (round === 0) console.log("Reaction surface snapshot:", JSON.stringify(await reactionSurfaceSnapshot(page)));
     if (await dialog.count().catch(() => 0) === 0) break;
-    const candidates = dialog.locator('a, [role="link"], button, [role="button"], [tabindex="0"], [data-control-name], [data-view-name], [data-test-id], span[dir="ltr"], span.hoverable-link-text, [class*="hoverable-link-text"]');
-    const count = Math.min(await candidates.count().catch(() => 0), 3000);
-    let clicked = 0;
-    const visitedLabels = new Set<string>();
-    for (let i = 0; i < count && results.length < max; i++) {
-      const candidate = candidates.nth(i);
-      const label = clean((await candidate.textContent().catch(() => "")) || (await candidate.getAttribute("aria-label").catch(() => "")) || (await candidate.getAttribute("title").catch(() => "")));
-      const href = normalizeLinkedInUrl(await candidate.getAttribute("href").catch(() => "") || "");
-      if (!label || label.length < 2 || label.length > 100 || visitedLabels.has(label)) continue;
-      if (/^(like|comment|share|send|follow|connect|message|more|close|back|next|previous|sort|filter|search|reactions?|see all|people who reacted|button|link|tab|menuitem|listitem|all|celebrate|support|love|insightful|funny)$/i.test(label)) continue;
-      visitedLabels.add(label);
-      if (isProfileUrl(href) && !seen.has(href.toLowerCase())) { seen.add(href.toLowerCase()); results.push({ profileUrl: href, name: label, type: "REACTION", reactionType: "UNKNOWN" }); continue; }
-      const beforeUrl = page.url();
-      const beforePages = page.context().pages();
-      try {
-        await candidate.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
-        const popupPromise = page.waitForEvent("popup", { timeout: 1000 }).catch(() => undefined);
-        await candidate.click({ timeout: 2500, force: false }).catch(async () => candidate.click({ timeout: 1500, force: true }));
-        const popup = await popupPromise;
-        await page.waitForTimeout(800);
-        clicked++;
-        const pagesNow = page.context().pages();
-        const newPage = pagesNow.find(p => !beforePages.includes(p) && !p.isClosed());
-        const target = popup && !popup.isClosed() ? popup : (newPage ?? page);
-        const targetUrl = normalizeLinkedInUrl(target.url());
-        if (isProfileUrl(targetUrl) && !seen.has(targetUrl.toLowerCase())) { seen.add(targetUrl.toLowerCase()); results.push({ profileUrl: targetUrl, name: label, type: "REACTION", reactionType: "UNKNOWN" }); console.log(`Captured reaction profile URL by click: ${targetUrl}`); }
-        else results.push(...await collectProfileLinks(target, seen, "REACTION", max - results.length));
-        if (popup && !popup.isClosed()) await popup.close().catch(() => {});
-        if (newPage && !newPage.isClosed()) await newPage.close().catch(() => {});
-        if (target === page && page.url() !== beforeUrl && !isProfileUrl(page.url())) { await page.goBack({ waitUntil: "domcontentloaded", timeout: 9000 }).catch(() => {}); await page.waitForTimeout(400); }
-        await closeTransientProfile(page);
-      } catch { }
-    }
+    const clickedResults = await captureReactionCandidates(dialog, page, seen, max - results.length);
+    results.push(...clickedResults);
+    if (results.length >= max) break;
     const scrolled = await scrollReactionDialog(dialog, page);
-    if (!scrolled && clicked === 0) break;
+    if (!scrolled && clickedResults.length === 0) break;
     await page.waitForTimeout(600);
     if (!scrolled && round > 2) break;
   }
   if (!results.length) {
     const snapshot = await reactionSurfaceSnapshot(page);
-    warnings.push(`Reaction extraction found no profile URLs. Diagnostic: surfaces=${snapshot.surfaceCount}, pageProfileLinks=${snapshot.profileLinksOnPage}, text=${clean(snapshot.text).slice(0, 240)}`);
+    warnings.push(`Reaction extraction found no profile URLs. Diagnostic: surfaces=${snapshot.surfaceCount}, pageProfileLinks=${snapshot.profileLinksOnPage}, selectedProfileLinks=${snapshot.selectedProfileLinks ?? 0}, text=${clean(snapshot.text).slice(0, 240)}`);
   }
   return results;
 }
