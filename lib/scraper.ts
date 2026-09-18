@@ -47,5 +47,48 @@ async function visibleReactionRows(page:Page,max:number){
 }
 
 async function findPostReactionControl(page:Page,postUrl:string):Promise<Locator|null>{const countRe=/^\s*\d[\d,.]*\s+(?:reactions?|likes?)\s*$/i;const all=page.locator("button,a,[role='button'],span,div");const n=Math.min(await all.count().catch(()=>0),4500);const candidates:string[]=[];for(let i=0;i<n;i++){const x=all.nth(i);if(!(await x.isVisible().catch(()=>false)))continue;const text=clean(await x.innerText().catch(()=>""));const aria=clean(await x.getAttribute("aria-label").catch(()=>""));const title=clean(await x.getAttribute("title").catch(()=>""));const s=text+" "+aria+" "+title;if(/reaction button state|comment reaction|^like$|^reply$|^comment$/i.test(s))continue;if(countRe.test(text)||countRe.test(aria)||countRe.test(title)){const clickable=await nearestClickable(x);if(await clickable.isVisible().catch(()=>false)){console.log(`Post reaction-count control matched: text="${text}" aria="${aria}" title="${title}"`);return clickable;}}if(/^\s*\d[\d,.]*\s*$/.test(text)){const parent=x.locator("xpath=..");const ps=clean(await parent.innerText().catch(()=>""))+" "+clean(await parent.getAttribute("aria-label").catch(()=>""))+" "+clean(await parent.getAttribute("title").catch(()=>""));if(/\breactions?\b|\blikes?\b/i.test(ps)&&!/comment|reply|reaction button state/i.test(ps)){const clickable=await nearestClickable(parent);if(await clickable.isVisible().catch(()=>false)){console.log(`Post reaction-count ancestor matched: "${ps.slice(0,180)}"`);return clickable;}}}if(/reaction|like/i.test(aria+" "+title)&&candidates.length<25)candidates.push(s.slice(0,140));}console.log(`Post reaction-count diagnostics: no count control found; candidates=${candidates.join(" | ")||"none"}`);return null;}
-async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){const c=await findPostReactionControl(page,postUrl);if(!c){const rows=await visibleReactionRows(page,max);if(rows.length){console.log("Reaction extraction fallback: using visible 'reacted with' rows.");return rows;}warnings.push("Could not locate the reaction interaction control inside the LinkedIn post.");return [];}await clickControl(page,c,"Reaction interaction");const surface=await reactionSurfaceAfterClick(page);if(!surface){const rows=await visibleReactionRows(page,max);if(rows.length){console.log("Reaction extraction fallback: using visible 'reacted with' rows after click.");return rows;}warnings.push("Reaction dialog did not appear after opening the reaction interaction.");console.log("Reaction DOM diagnostics: no visible reaction overlay found.");return [];}const reactions:ScrapedEngagement[]=[];const seen=new Set<string>();for(let round=0;round<30&&reactions.length<max;round++){const anchors=surface.locator('a[href*="/in/"],a[data-profile-url],a[data-test-profile-url]');const n=Math.min(await anchors.count().catch(()=>0),2000);let added=0;for(let i=0;i<n&&reactions.length<max;i++){const a=anchors.nth(i);if(!(await a.isVisible().catch(()=>false)))continue;const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");const name=clean((await a.innerText().catch(()=>""))||(await a.getAttribute("aria-label").catch(()=>""))).split(/•|\n/)[0].trim();const key=href.toLowerCase();if(!href||!name||generic(name)||seen.has(key))continue;seen.add(key);reactions.push({profileUrl:href,name,type:"REACTION",reactionType:"UNKNOWN"});added++;}const more=surface.locator("button,[role='button'],a").filter({hasText:/load more|show more|more reactions|see more/i}).first();if(await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false)){await more.click({timeout:3000}).catch(()=>{});await page.waitForTimeout(650);}else{await surface.mouse.wheel(0,1200).catch(()=>{});await page.waitForTimeout(450);}if(!added&&!(await more.count().catch(()=>0)))break;}console.log("Reaction DOM diagnostics: overlay profile anchors="+reactions.length);if(!reactions.length)warnings.push("Reaction overlay opened, but no public LinkedIn profile URLs were found inside the reaction surface.");return reactions;}
+async function snapshotVisibleProfiles(page:Page){
+  const anchors=page.locator('a[href*="/in/"],a[data-profile-url],a[data-test-profile-url]');
+  const out=new Map<string,{href:string,name:string}>();
+  const n=Math.min(await anchors.count().catch(()=>0),3000);
+  for(let i=0;i<n;i++){
+    const a=anchors.nth(i);
+    if(!(await a.isVisible().catch(()=>false)))continue;
+    const href=profile((await a.getAttribute("href").catch(()=> ""))||(await a.getAttribute("data-profile-url").catch(()=> ""))||(await a.getAttribute("data-test-profile-url").catch(()=> ""))||"");
+    const raw=clean((await a.innerText().catch(()=> ""))||(await a.getAttribute("aria-label").catch(()=> "")));
+    const name=raw.split(/•|\\n/)[0].trim();
+    if(href&&name&&!generic(name))out.set(href.toLowerCase(),{href,name});
+  }
+  return out;
+}
+async function reactionProfilesAfterClick(page:Page,before:Map<string,{href:string,name:string}>,max:number){
+  for(let round=0;round<20;round++){
+    const now=await snapshotVisibleProfiles(page);
+    const fresh=[...now.values()].filter(x=>!before.has(x.href.toLowerCase()));
+    if(fresh.length){
+      console.log("Reaction DOM diagnostics: new profile anchors after reaction click="+fresh.length);
+      return fresh.slice(0,max).map(x=>({profileUrl:x.href,name:x.name,type:"REACTION" as const,reactionType:"UNKNOWN"}));
+    }
+    await page.waitForTimeout(300);
+  }
+  return [];
+}
+async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){
+  const before=await snapshotVisibleProfiles(page);
+  const c=await findPostReactionControl(page,postUrl);
+  if(!c){
+    warnings.push("Could not locate the reaction interaction control inside the LinkedIn post.");
+    return [];
+  }
+  await clickControl(page,c,"Reaction interaction");
+  const fresh=await reactionProfilesAfterClick(page,before,max);
+  if(fresh.length){
+    console.log("Reaction extraction: captured "+fresh.length+" newly exposed profile(s) after clicking reaction count.");
+    return fresh;
+  }
+  console.log("Reaction DOM diagnostics: reaction click produced no newly exposed profile anchors.");
+  warnings.push("Reaction dialog did not appear after opening the reaction interaction.");
+  return [];
+}
+
 export async function scrapePublicPost(postUrl:string,options:{maxComments?:number;maxReactions?:number}={}):Promise<ScrapeResult>{console.log(`Scraper DOM version: ${SCRAPER_DOM_VERSION}`);const maxComments=options.maxComments??500,maxReactions=options.maxReactions??500,warnings:string[]=[];const {browser,page}=await connect();try{await page.goto(postUrl,{waitUntil:"domcontentloaded",timeout:30000});await page.waitForTimeout(2000);const signedOut=await page.locator('input[name="session_key"],form[action*="login"]').count().catch(()=>0);console.log(`LinkedIn session: ${signedOut?"SIGNED OUT":"SIGNED IN"}`);if(signedOut)warnings.push("LinkedIn appears to be signed out in the connected Chrome profile.");const comments=await extractComments(page,maxComments,postUrl);const reactions=await extractReactions(page,maxReactions,postUrl,warnings);const merged=new Map<string,ScrapedEngagement>();for(const item of [...reactions,...comments]){const key=normalizeLinkedInUrl(item.profileUrl).toLowerCase();if(!key)continue;const old=merged.get(key);if(!old||item.type==="COMMENT")merged.set(key,item);}console.log(`Engagement merge: comments=${comments.length}, reactions=${reactions.length}, unique=${merged.size}.`);return{engagements:[...merged.values()],warnings};}finally{await page.close().catch(()=>{});await browser.close().catch(()=>{});}}
