@@ -51,7 +51,7 @@ async function collectProfileLinks(scope: Locator, seen: Set<string>, type: "COM
   for (let i = 0; i < count && result.length < limit; i++) {
     const anchor = anchors.nth(i);
     const href = normalizeLinkedInUrl((await anchor.getAttribute("href").catch(() => "")) || (await anchor.getAttribute("data-test-profile-url").catch(() => "")) || (await anchor.getAttribute("data-profile-url").catch(() => "")) || "");
-    if (!isProfileUrl(href) || seen.has(href.toLowerCase())) continue;
+    if (!isProfileUrl(href) || excludedProfiles.has(href.toLowerCase()) || seen.has(href.toLowerCase())) continue;
     const name = clean((await anchor.textContent().catch(() => "")) || (await anchor.getAttribute("aria-label").catch(() => "")));
     const row = profileRow(anchor);
     const rowText = clean(await row.textContent().catch(() => ""));
@@ -169,7 +169,42 @@ async function captureReactionCandidates(dialog: Locator, page: Page, seen: Set<
   return results;
 }
 
-async function collectReactionPeople(page: Page, max: number, warnings: string[]) {
+async function collectExcludedProfileUrls(page: Page): Promise<Set<string>> {
+  const excluded = new Set<string>();
+
+  // The post author is present on the post page but is not an engagement.
+  const postCandidates = page.locator('article, [data-urn*="activity"], [data-urn*="ugcPost"], [data-id*="ugcPost"], [data-id*="urn:li:activity"]');
+  const postCount = Math.min(await postCandidates.count().catch(() => 0), 30);
+  for (let i = 0; i < postCount; i++) {
+    const post = postCandidates.nth(i);
+    if (!(await post.isVisible().catch(() => false))) continue;
+    const links = post.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
+    const linkCount = Math.min(await links.count().catch(() => 0), 10);
+    for (let j = 0; j < linkCount; j++) {
+      const link = links.nth(j);
+      const href = normalizeLinkedInUrl((await link.getAttribute("href").catch(() => "")) || (await link.getAttribute("data-test-profile-url").catch(() => "")) || (await link.getAttribute("data-profile-url").catch(() => "")) || "");
+      if (isProfileUrl(href)) excluded.add(href.toLowerCase());
+    }
+    if (excluded.size) break;
+  }
+
+  // The signed-in account can appear in global navigation. Exclude only links explicitly labeled Me/My profile.
+  const allLinks = page.locator('a[href*="/in/"], a[data-test-profile-url], a[data-profile-url]');
+  const allCount = Math.min(await allLinks.count().catch(() => 0), 3000);
+  for (let i = 0; i < allCount; i++) {
+    const link = allLinks.nth(i);
+    if (!(await link.isVisible().catch(() => false))) continue;
+    const label = clean((await link.getAttribute("aria-label").catch(() => "")) || (await link.getAttribute("title").catch(() => "")) || (await link.textContent().catch(() => "")));
+    if (!/^(me|my profile)$/i.test(label)) continue;
+    const href = normalizeLinkedInUrl((await link.getAttribute("href").catch(() => "")) || (await link.getAttribute("data-test-profile-url").catch(() => "")) || (await link.getAttribute("data-profile-url").catch(() => "")) || "");
+    if (isProfileUrl(href)) excluded.add(href.toLowerCase());
+  }
+
+  console.log(`Excluded non-engagement profiles: ${excluded.size}`);
+  return excluded;
+}
+
+async function collectReactionPeople(page: Page, max: number, warnings: string[], excludedProfiles: Set<string>) {
   const seen = new Set<string>();
   const results: ScrapedEngagement[] = [];
   const beforeUrl = page.url();
@@ -246,7 +281,8 @@ export async function scrapePublicPost(postUrl: string, options: { maxComments?:
     engagements.push(...comments);
     console.log(`Comment extraction: ${comments.length} profile(s) captured.`);
 
-    const reactions = await collectReactionPeople(page, maxReactions, warnings);
+    const excludedProfiles = await collectExcludedProfileUrls(page);
+    const reactions = await collectReactionPeople(page, maxReactions, warnings, excludedProfiles);
     engagements.push(...reactions);
     console.log(`Reaction extraction: ${reactions.length} profile(s) captured.`);
 
