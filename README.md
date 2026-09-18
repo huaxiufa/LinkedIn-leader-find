@@ -76,14 +76,13 @@ If CDP is enabled, Chrome returns JSON containing a `webSocketDebuggerUrl` field
 - `worker`: scraping worker connected to Windows Chrome via CDP
 - `postgres`: PostgreSQL database on port 5432
 
-There is no Docker Chromium, VNC/noVNC service, or separate browser login inside Docker.
+There is no separate browser login inside Docker. The worker uses your Windows Chrome through CDP.
 
 ## Scraping behavior
 
 - Uses the user's own Windows Chrome LinkedIn login session.
 - Reads engagement data exposed to that account in the LinkedIn UI.
 - Scrolls the reaction-user panel to load more visible users.
-- Can use normal profile clicks as a fallback to capture a profile URL and then return/close the profile page.
 - Deduplicates people by normalized LinkedIn profile URL.
 - Gives comments priority over reactions for the same person.
 - Applies include/exclude title keyword filters.
