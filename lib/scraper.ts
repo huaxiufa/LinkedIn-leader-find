@@ -33,7 +33,19 @@ async function climbComment(anchor:Locator){
 async function extractComments(page:Page,max:number,postUrl:string){
   const c=await controls(page,"comments",postUrl);
   if(c)await clickControl(page,c,"Comment interaction");else console.log("Comment count control not found; scanning current comment UI only.");
-  await page.waitForTimeout(500);
+
+  // LinkedIn often lazy-loads comments only after the comment control is clicked and
+  // the feed is scrolled. Do that before inspecting profile links.
+  for(let pass=0;pass<10;pass++){
+    const more=page.locator("button,[role='button'],a").filter({hasText:/load more comments?|more comments?|show more comments?/i}).first();
+    if(await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false)){
+      await more.click({timeout:3000}).catch(()=>{});
+      await page.waitForTimeout(700);
+    }
+    await page.keyboard.press("PageDown").catch(()=>{});
+    await page.waitForTimeout(450);
+  }
+
   const selectors=[
     "[class*='comments-comment-item']",
     "[class*='feed-shared-update-v2__comment-item']",
@@ -45,11 +57,13 @@ async function extractComments(page:Page,max:number,postUrl:string){
   const items=page.locator(selectors.join(","));
   const itemCount=await items.count().catch(()=>0);
   const out:ScrapedEngagement[]=[];const seen=new Set<string>();const rejected:string[]=[];
+
+  // First pass: real comment containers. Never treat arbitrary page profile links as comments.
   if(itemCount){
     const n=Math.min(itemCount,Math.max(max*4,50));
     for(let i=0;i<n&&out.length<max;i++){
       const item=items.nth(i);if(!(await item.isVisible().catch(()=>false)))continue;
-      const anchors=profileAnchors(item);const an=Math.min(await anchors.count().catch(()=>0),6);
+      const anchors=profileAnchors(item);const an=Math.min(await anchors.count().catch(()=>0),8);
       for(let j=0;j<an&&out.length<max;j++){
         const x=anchors.nth(j);if(!(await x.isVisible().catch(()=>false)))continue;
         const href=profile((await x.getAttribute("href").catch(()=> ""))||(await x.getAttribute("data-profile-url").catch(()=> ""))||(await x.getAttribute("data-test-profile-url").catch(()=> ""))||"");
@@ -57,7 +71,7 @@ async function extractComments(page:Page,max:number,postUrl:string){
         const name=rawName.split(/•|\n/)[0].trim();const key=href.toLowerCase();
         if(!href||!name||generic(name)||seen.has(key))continue;
         const txt=clean(await item.textContent().catch(()=> ""));
-        if(!/\breply\b|\blike\b|\btranslate\b/i.test(txt)){if(rejected.length<12)rejected.push(name+" => no-comment-controls");continue;}
+        if(!/\breply\b|\blike\b|\btranslate\b/i.test(txt))continue;
         const lines=txt.split(/\n+/).map(clean).filter(Boolean);
         const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
         const body=idx>=0?lines.slice(idx+1).filter(v=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(v)).join(" ").slice(0,5000):"";
@@ -65,22 +79,30 @@ async function extractComments(page:Page,max:number,postUrl:string){
       }
     }
   }
-  if(!out.length){
-    const root=commentSurface(page);const scope=await root.count().catch(()=>0)?root:page.locator("main").first();
-    const anchors=profileAnchors(scope);const an=Math.min(await anchors.count().catch(()=>0),Math.max(max*12,150));
+
+  // Second pass: current LinkedIn builds sometimes omit the old comment-item class.
+  // Walk upward from each visible profile anchor, but require a nearby Reply action.
+  if(out.length<max){
+    const root=commentSurface(page);
+    const scope=await root.count().catch(()=>0)?root:page.locator("main").first();
+    const anchors=profileAnchors(scope);
+    const an=Math.min(await anchors.count().catch(()=>0),Math.max(max*20,300));
     for(let i=0;i<an&&out.length<max;i++){
       const x=anchors.nth(i);if(!(await x.isVisible().catch(()=>false)))continue;
       const href=profile((await x.getAttribute("href").catch(()=> ""))||(await x.getAttribute("data-profile-url").catch(()=> ""))||(await x.getAttribute("data-test-profile-url").catch(()=> ""))||"");
       const rawName=clean((await x.textContent().catch(()=> ""))||(await x.getAttribute("aria-label").catch(()=> "")));
       const name=rawName.split(/•|\n/)[0].trim();const key=href.toLowerCase();
       if(!href||!name||generic(name)||seen.has(key))continue;
-      const box=await climbComment(x);if(!box){if(rejected.length<12)rejected.push(name+" => "+href);continue;}
+      const box=await climbComment(x);
+      if(!box){if(rejected.length<20)rejected.push(name+" => "+href);continue;}
       const txt=clean(await box.textContent().catch(()=> ""));if(txt.length>15000)continue;
-      const lines=txt.split(/\n+/).map(clean).filter(Boolean);const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
+      const lines=txt.split(/\n+/).map(clean).filter(Boolean);
+      const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
       const body=idx>=0?lines.slice(idx+1).filter(v=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(v)).join(" ").slice(0,5000):"";
       seen.add(key);out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});
     }
   }
+
   console.log("Comment diagnostics: itemContainers="+itemCount+", captured="+out.length+", rejected="+(rejected.join(" || ")||"none"));
   return out;
 }
