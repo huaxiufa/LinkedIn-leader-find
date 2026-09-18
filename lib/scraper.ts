@@ -113,29 +113,41 @@ async function extractComments(page:Page,max:number,postUrl:string){
   return out;
 }
 async function findPostReactionControl(page:Page,postUrl:string):Promise<Locator|null>{
-  // LinkedIn does not reliably expose the post id in data-urn/data-id. The
-  // stable rendered signal is the post-level reaction count such as
-  // "3 reactions" / "3 likes". Scan visible UI text/ARIA and climb to the
-  // nearest clickable element. Reject comment-level reaction controls.
+  // The Like/Reaction action toggles the signed-in user's reaction. We must
+  // click the separate post-level reaction COUNT to open the reactor list.
+  const countRe=/^\\s*\\d[\\d,.]*\\s+(?:reactions?|likes?)\\s*$/i;
   const all=page.locator("button,a,[role='button'],span,div");
-  const n=Math.min(await all.count().catch(()=>0),3500);
-  const countRe=/^\s*\d[\d,.]*\s+(?:reactions?|likes?)\s*$/i;
-  let fallback:Locator|null=null;
+  const n=Math.min(await all.count().catch(()=>0),4500);
+  const candidates:string[]=[];
   for(let i=0;i<n;i++){
     const x=all.nth(i);
-    if(!(await x.isVisible().catch(()=>false))) continue;
+    if(!(await x.isVisible().catch(()=>false)))continue;
     const text=clean(await x.innerText().catch(()=>""));
     const aria=clean(await x.getAttribute("aria-label").catch(()=>""));
     const title=clean(await x.getAttribute("title").catch(()=>""));
     const s=text+" "+aria+" "+title;
-    if(/reaction button state|comment reaction|^reply$/i.test(s)) continue;
+    if(/reaction button state|comment reaction|^like$|^reply$|^comment$/i.test(s))continue;
     if(countRe.test(text)||countRe.test(aria)||countRe.test(title)){
       const clickable=await nearestClickable(x);
-      if(await clickable.isVisible().catch(()=>false)) return clickable;
+      if(await clickable.isVisible().catch(()=>false)){
+        console.log(`Post reaction-count control matched: text="${text}" aria="${aria}" title="${title}"`);
+        return clickable;
+      }
     }
-    if(/(?:view|open|see).*?(?:reactions?|likes?)/i.test(s) && !/comment|reply/i.test(s)) fallback=await nearestClickable(x);
+    if(/^\\s*\\d[\\d,.]*\\s*$/.test(text)){
+      const parent=x.locator("xpath=..");
+      const ps=clean(await parent.innerText().catch(()=>""))+" "+clean(await parent.getAttribute("aria-label").catch(()=>""))+" "+clean(await parent.getAttribute("title").catch(()=>""));
+      if(/\\breactions?\\b|\\blikes?\\b/i.test(ps)&&!/comment|reply|reaction button state/i.test(ps)){
+        const clickable=await nearestClickable(parent);
+        if(await clickable.isVisible().catch(()=>false)){
+          console.log(`Post reaction-count ancestor matched: "${ps.slice(0,180)}"`);
+          return clickable;
+        }
+      }
+    }
+    if(/reaction|like/i.test(aria+" "+title)&&candidates.length<25)candidates.push(s.slice(0,140));
   }
-  if(fallback && await fallback.isVisible().catch(()=>false)) return fallback;
+  console.log(`Post reaction-count diagnostics: no count control found; candidates=${candidates.join(" | ")||"none"}`);
   return null;
 }
 async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){
