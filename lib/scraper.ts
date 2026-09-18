@@ -6,7 +6,7 @@ export type ScrapedEngagement = { profileUrl:string; name:string; headline?:stri
 export type ScrapeResult = { engagements:ScrapedEngagement[]; warnings:string[] };
 const clean=(v:string|null|undefined)=>(v??"").replace(/\s+/g," ").trim();
 const profile=(v:string)=>{const u=normalizeLinkedInUrl(v);return /linkedin\.com\/in\//i.test(u)?u:"";};
-const SCRAPER_DOM_VERSION="2026-09-18-exact-comment-item-dialog-v1";
+const SCRAPER_DOM_VERSION="2026-09-18-post-reaction-control-comment-marker-v2";
 const generic=(v:string)=>/^(like|comment|repost|send|follow|most relevant|most recent|reactions?|likes?|people who reacted|close|cancel|done|back|next|previous|see all|show more|load more|connections?|grow your network|my network|notifications?|messaging|jobs|home|search|me|for business|celebrate|support|love|insightful|funny)$/i.test(clean(v))||clean(v).length<2;
 async function connect(){const configured=new URL(process.env.LINKEDIN_CDP_URL??"http://host.docker.internal:9222");let host=configured.hostname;if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)&&host!=="localhost"){const a=await lookup(host,{all:true});const v4=a.find(x=>x.family===4);if(!v4)throw new Error(`Could not resolve ${host} to IPv4.`);host=v4.address;}const endpoint=`http://${host}:${configured.port||"9222"}`;const r=await fetch(`${endpoint}/json/version`,{headers:{Host:host}});if(!r.ok)throw new Error(`Chrome CDP endpoint returned HTTP ${r.status}.`);const v=await r.json() as {Browser?:string;webSocketDebuggerUrl?:string};console.log(`Chrome CDP browser: ${v.Browser??"unknown"}`);if(!v.webSocketDebuggerUrl)throw new Error("Chrome CDP did not return a browser WebSocket endpoint.");const browser=await chromium.connectOverCDP(v.webSocketDebuggerUrl,{timeout:90000});const context=browser.contexts()[0];if(!context)throw new Error("Chrome CDP connected, but no browser context is available.");return {browser,page:await context.newPage()};}
 async function nearestClickable(node:Locator){const c=node.locator("xpath=ancestor-or-self::*[self::button or @role='button' or self::a][1]");return await c.count().catch(()=>0)?c.first():node;}
@@ -50,7 +50,7 @@ async function extractComments(page:Page,max:number,postUrl:string){
     await page.waitForTimeout(300);
   }
 
-  const markers=page.locator('button[aria-label*="comment" i]');
+  const markers=page.locator('button[aria-label^="View more options for " i][aria-label$=" comment." i]');
   const markerCount=Math.min(await markers.count().catch(()=>0),1000);
   const out:ScrapedEngagement[]=[];
   const seen=new Set<string>();
@@ -112,8 +112,34 @@ async function extractComments(page:Page,max:number,postUrl:string){
   if(!markerCount) console.log("Comment DOM diagnostics: no button[aria-label*=comment] markers found.");
   return out;
 }
+async function findPostReactionControl(page:Page,postUrl:string):Promise<Locator|null>{
+  const id=postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1]??"";
+  const candidates=id?page.locator('[data-urn*="'+id+'"],[data-id*="'+id+'"]'):page.locator("article");
+  const n=Math.min(await candidates.count().catch(()=>0),20);
+  for(let i=0;i<n;i++){
+    const node=candidates.nth(i);
+    if(!(await node.isVisible().catch(()=>false))) continue;
+    const root=node.locator("xpath=self::article | ancestor::article[1]");
+    const post=await root.count().catch(()=>0)?root.first():node;
+    const controls=post.locator("button,a,[role='button']");
+    const m=Math.min(await controls.count().catch(()=>0),1200);
+    let fallback:Locator|null=null;
+    for(let j=0;j<m;j++){
+      const x=controls.nth(j);
+      if(!(await x.isVisible().catch(()=>false))) continue;
+      const text=clean(await x.innerText().catch(()=>""));
+      const aria=clean(await x.getAttribute("aria-label").catch(()=>""));
+      const title=clean(await x.getAttribute("title").catch(()=>""));
+      const s=text+" "+aria+" "+title;
+      if(/\b\d[\d,.]*\s+(?:reactions?|likes?)\b/i.test(s)) return x;
+      if(/(?:view|open|see).*?(?:reactions?|likes?)/i.test(s) && !/reply|comment reaction|reaction button state/i.test(s)) fallback=x;
+    }
+    if(fallback) return fallback;
+  }
+  return null;
+}
 async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){
-  const c=await controls(page,"reactions",postUrl);
+  const c=await findPostReactionControl(page,postUrl);
   if(!c){warnings.push("Could not locate the reaction interaction control inside the LinkedIn post.");return [];}
   await clickControl(page,c,"Reaction interaction");
 
