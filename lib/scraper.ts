@@ -32,79 +32,128 @@ async function climbComment(anchor:Locator){
 }
 async function extractComments(page:Page,max:number,postUrl:string){
   const c=await controls(page,"comments",postUrl);
-  if(c)await clickControl(page,c,"Comment interaction");else console.log("Comment count control not found; scanning current comment UI only.");
+  if(c) await clickControl(page,c,"Comment interaction");
+  else console.log("Comment count control not found; scanning current comment UI only.");
 
-  // LinkedIn often lazy-loads comments only after the comment control is clicked and
-  // the feed is scrolled. Do that before inspecting profile links.
-  for(let pass=0;pass<10;pass++){
+  // Load the comment section before reading it. LinkedIn uses lazy loading.
+  for(let pass=0;pass<12;pass++){
     const more=page.locator("button,[role='button'],a").filter({hasText:/load more comments?|more comments?|show more comments?/i}).first();
-    if(await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false)){
+    if(await more.count().catch(()=>0) && await more.isVisible().catch(()=>false)){
       await more.click({timeout:3000}).catch(()=>{});
-      await page.waitForTimeout(700);
+      await page.waitForTimeout(600);
     }
-    await page.keyboard.press("PageDown").catch(()=>{});
-    await page.waitForTimeout(450);
+    await page.mouse.wheel(0,1200).catch(()=>{});
+    await page.waitForTimeout(350);
   }
 
-  const selectors=[
-    "[class*='comments-comment-item']",
-    "[class*='feed-shared-update-v2__comment-item']",
-    "[data-view-name*='comment']",
-    "[data-test-id*='comment']",
-    "article.comments-comment-item",
-    "li.comments-comment-item"
-  ];
-  const items=page.locator(selectors.join(","));
+  // Authoritative DOM path: LinkedIn comment items themselves.
+  // Do NOT fall back to arbitrary /in/ links on the page, because those include
+  // the post author, company links, hover cards, etc.
+  const items=page.locator(".comments-comment-item");
   const itemCount=await items.count().catch(()=>0);
-  const out:ScrapedEngagement[]=[];const seen=new Set<string>();const rejected:string[]=[];
+  const out:ScrapedEngagement[]=[];
+  const seen=new Set<string>();
 
-  // First pass: real comment containers. Never treat arbitrary page profile links as comments.
-  if(itemCount){
-    const n=Math.min(itemCount,Math.max(max*4,50));
-    for(let i=0;i<n&&out.length<max;i++){
-      const item=items.nth(i);if(!(await item.isVisible().catch(()=>false)))continue;
-      const anchors=profileAnchors(item);const an=Math.min(await anchors.count().catch(()=>0),8);
-      for(let j=0;j<an&&out.length<max;j++){
-        const x=anchors.nth(j);if(!(await x.isVisible().catch(()=>false)))continue;
-        const href=profile((await x.getAttribute("href").catch(()=> ""))||(await x.getAttribute("data-profile-url").catch(()=> ""))||(await x.getAttribute("data-test-profile-url").catch(()=> ""))||"");
-        const rawName=clean((await x.textContent().catch(()=> ""))||(await x.getAttribute("aria-label").catch(()=> "")));
-        const name=rawName.split(/•|\n/)[0].trim();const key=href.toLowerCase();
-        if(!href||!name||generic(name)||seen.has(key))continue;
-        const txt=clean(await item.textContent().catch(()=> ""));
-        if(!/\breply\b|\blike\b|\btranslate\b/i.test(txt))continue;
-        const lines=txt.split(/\n+/).map(clean).filter(Boolean);
-        const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
-        const body=idx>=0?lines.slice(idx+1).filter(v=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(v)).join(" ").slice(0,5000):"";
-        seen.add(key);out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});break;
-      }
+  for(let i=0;i<itemCount && out.length<max;i++){
+    const item=items.nth(i);
+    if(!(await item.isVisible().catch(()=>false))) continue;
+
+    const anchors=item.locator('a[href*="/in/"]');
+    const an=Math.min(await anchors.count().catch(()=>0),8);
+    if(!an) continue;
+
+    let chosen:Locator|null=null;
+    let chosenHref="";
+    let chosenName="";
+    for(let j=0;j<an;j++){
+      const a=anchors.nth(j);
+      if(!(await a.isVisible().catch(()=>false))) continue;
+      const href=profile(await a.getAttribute("href").catch(()=> ""));
+      const rawName=clean((await a.innerText().catch(()=> ""))||(await a.getAttribute("aria-label").catch(()=> "")));
+      const name=rawName.split(/•|\\n/)[0].trim();
+      if(!href||!name||generic(name)||seen.has(href.toLowerCase())) continue;
+      chosen=a;chosenHref=href;chosenName=name;break;
     }
+    if(!chosen) continue;
+
+    const txt=clean(await item.innerText().catch(()=> ""));
+    const lines=txt.split(/\n+/).map(clean).filter(Boolean);
+    const lower=lines.map(x=>x.toLowerCase());
+    const idx=lower.findIndex(x=>x.includes(chosenName.toLowerCase()));
+    const body=idx>=0
+      ?lines.slice(idx+1).filter(x=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(x)).join(" ").slice(0,5000)
+      :"";
+
+    const key=chosenHref.toLowerCase();
+    seen.add(key);
+    out.push({profileUrl:chosenHref,name:chosenName,type:"COMMENT",commentText:body||undefined});
   }
 
-  // Second pass: current LinkedIn builds sometimes omit the old comment-item class.
-  // Walk upward from each visible profile anchor, but require a nearby Reply action.
-  if(out.length<max){
-    const root=commentSurface(page);
-    const scope=await root.count().catch(()=>0)?root:page.locator("main").first();
-    const anchors=profileAnchors(scope);
-    const an=Math.min(await anchors.count().catch(()=>0),Math.max(max*20,300));
-    for(let i=0;i<an&&out.length<max;i++){
-      const x=anchors.nth(i);if(!(await x.isVisible().catch(()=>false)))continue;
-      const href=profile((await x.getAttribute("href").catch(()=> ""))||(await x.getAttribute("data-profile-url").catch(()=> ""))||(await x.getAttribute("data-test-profile-url").catch(()=> ""))||"");
-      const rawName=clean((await x.textContent().catch(()=> ""))||(await x.getAttribute("aria-label").catch(()=> "")));
-      const name=rawName.split(/•|\n/)[0].trim();const key=href.toLowerCase();
-      if(!href||!name||generic(name)||seen.has(key))continue;
-      const box=await climbComment(x);
-      if(!box){if(rejected.length<20)rejected.push(name+" => "+href);continue;}
-      const txt=clean(await box.textContent().catch(()=> ""));if(txt.length>15000)continue;
-      const lines=txt.split(/\n+/).map(clean).filter(Boolean);
-      const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
-      const body=idx>=0?lines.slice(idx+1).filter(v=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(v)).join(" ").slice(0,5000):"";
-      seen.add(key);out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});
-    }
-  }
-
-  console.log("Comment diagnostics: itemContainers="+itemCount+", captured="+out.length+", rejected="+(rejected.join(" || ")||"none"));
+  console.log("Comment DOM diagnostics: .comments-comment-item="+itemCount+", captured="+out.length);
+  if(!itemCount) console.log("Comment DOM diagnostics: no .comments-comment-item nodes found after loading; no page-wide profile fallback will be used.");
   return out;
 }
-async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){const c=await controls(page,"reactions",postUrl);if(!c){warnings.push("Could not locate the reaction interaction control inside the LinkedIn post.");return [];}const before=await snapshotProfileVisibility(page);await clickControl(page,c,"Reaction interaction");const reactions:ScrapedEngagement[]=[];const emitted=new Set<string>();for(let r=0;r<24&&reactions.length<max;r++){const anchors=profileAnchors(page);const n=Math.min(await anchors.count().catch(()=>0),2500);let found=0;for(let i=0;i<n&&reactions.length<max;i++){const a=anchors.nth(i);if(!(await a.isVisible().catch(()=>false)))continue;const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");const name=clean((await a.textContent().catch(()=>""))||(await a.getAttribute("aria-label").catch(()=>"")));const key=href.toLowerCase();if(!href||!name||generic(name)||emitted.has(key))continue;const beforeVisible=before.get(key)===true;const surface=await reactionSurfaceAfterClick(page);const inSurface=surface?await a.locator("xpath=ancestor-or-self::*").filter({has:surface}).count().catch(()=>0):0;if(beforeVisible&&!inSurface)continue;const context=clean(await a.locator("xpath=ancestor::*[self::li or self::div or self::article][1]").textContent().catch(()=>""));if(!inSurface&&/comment|reply/i.test(context)&&!/reaction|react|people who/i.test(context))continue;emitted.add(key);reactions.push({profileUrl:href,name,type:"REACTION",reactionType:"UNKNOWN"});found++;}const surface=await reactionSurfaceAfterClick(page);if(surface){await surface.focus().catch(()=>{});await surface.press("PageDown").catch(()=>{});}await page.waitForTimeout(500);if(!found&&!surface)break;}if(!reactions.length){warnings.push("Reaction interaction opened, but no reaction profiles could be identified without using unrelated page-wide profiles.");}console.log(`Reaction extraction: ${reactions.length} profile(s) captured.`);return reactions;}
+async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){
+  const c=await controls(page,"reactions",postUrl);
+  if(!c){warnings.push("Could not locate the reaction interaction control inside the LinkedIn post.");return [];}
+  await clickControl(page,c,"Reaction interaction");
+
+  // Authoritative DOM path: reaction dialog only.
+  // Never harvest /in/ links from the underlying post/page because those are
+  // unrelated people such as the author or hover-card targets.
+  let dialog:Locator|null=null;
+  for(let i=0;i<12;i++){
+    const dialogs=page.locator('div[role="dialog"]');
+    const n=Math.min(await dialogs.count().catch(()=>0),20);
+    for(let j=n-1;j>=0;j--){
+      const d=dialogs.nth(j);
+      if(!(await d.isVisible().catch(()=>false))) continue;
+      const anchors=d.locator('a[href*="/in/"]');
+      const text=clean(await d.innerText().catch(()=> ""));
+      if((await anchors.count().catch(()=>0))>0 || /people who reacted|reactions?|likes?/i.test(text)){dialog=d;break;}
+    }
+    if(dialog)break;
+    await page.waitForTimeout(300);
+  }
+
+  if(!dialog){
+    warnings.push("Reaction dialog did not appear after opening the reaction interaction.");
+    console.log("Reaction DOM diagnostics: div[role=dialog] not found.");
+    return [];
+  }
+
+  const reactions:ScrapedEngagement[]=[];
+  const seen=new Set<string>();
+  for(let round=0;round<30 && reactions.length<max;round++){
+    const anchors=dialog.locator('a[href*="/in/"]');
+    const n=Math.min(await anchors.count().catch(()=>0),2000);
+    let added=0;
+    for(let i=0;i<n && reactions.length<max;i++){
+      const a=anchors.nth(i);
+      if(!(await a.isVisible().catch(()=>false))) continue;
+      const href=profile(await a.getAttribute("href").catch(()=> ""));
+      const name=clean((await a.innerText().catch(()=> ""))||(await a.getAttribute("aria-label").catch(()=> ""))).split(/•|\\n/)[0].trim();
+      const key=href.toLowerCase();
+      if(!href||!name||generic(name)||seen.has(key)) continue;
+      seen.add(key);
+      reactions.push({profileUrl:href,name,type:"REACTION",reactionType:"UNKNOWN"});
+      added++;
+    }
+
+    const more=dialog.locator("button,[role='button'],a").filter({hasText:/load more|show more|more reactions|see more/i}).first();
+    if(await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false)){
+      await more.click({timeout:3000}).catch(()=>{});
+      await page.waitForTimeout(650);
+    }else{
+      await dialog.mouse.wheel(0,1200).catch(()=>{});
+      await page.waitForTimeout(450);
+    }
+
+    if(!added && !(await more.count().catch(()=>0))) break;
+  }
+
+  console.log("Reaction DOM diagnostics: div[role=dialog] profile anchors="+reactions.length);
+  if(!reactions.length) warnings.push("Reaction dialog opened, but no public LinkedIn profile URLs were found inside div[role=dialog].");
+  return reactions;
+}
 export async function scrapePublicPost(postUrl:string,options:{maxComments?:number;maxReactions?:number}={}):Promise<ScrapeResult>{const maxComments=options.maxComments??500,maxReactions=options.maxReactions??500,warnings:string[]=[];const {browser,page}=await connect();try{await page.goto(postUrl,{waitUntil:"domcontentloaded",timeout:30000});await page.waitForTimeout(2000);const signedOut=await page.locator('input[name="session_key"],form[action*="login"]').count().catch(()=>0);console.log(`LinkedIn session: ${signedOut?"SIGNED OUT":"SIGNED IN"}`);if(signedOut)warnings.push("LinkedIn appears to be signed out in the connected Chrome profile.");const comments=await extractComments(page,maxComments,postUrl);const reactions=await extractReactions(page,maxReactions,postUrl,warnings);const merged=new Map<string,ScrapedEngagement>();for(const item of [...reactions,...comments]){const key=normalizeLinkedInUrl(item.profileUrl).toLowerCase();if(!key)continue;const old=merged.get(key);if(!old||item.type==="COMMENT")merged.set(key,item);}console.log(`Engagement merge: comments=${comments.length}, reactions=${reactions.length}, unique=${merged.size}.`);return{engagements:[...merged.values()],warnings};}finally{await page.close().catch(()=>{});await browser.close().catch(()=>{});}}
