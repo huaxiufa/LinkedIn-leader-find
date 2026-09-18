@@ -13,6 +13,50 @@ function profileAnchors(page:Page|Locator){return page.locator('a[href*="/in/"],
 async function snapshotProfiles(page:Page){const seen=new Set<string>();const anchors=profileAnchors(page);const n=Math.min(await anchors.count().catch(()=>0),2500);for(let i=0;i<n;i++){const a=anchors.nth(i);const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");if(href)seen.add(href.toLowerCase());}return seen;}
 function reactionSurface(page:Page){return page.locator('[role="dialog"],[role="listbox"],[role="list"],[role="tabpanel"],.artdeco-modal,.artdeco-popover,[data-test-modal],[data-test-dialog],[data-test-popover]').filter({hasText:/people who reacted|\breactions?\b|\blikes?/i}).last();}
 async function waitReactionSurface(page:Page):Promise<Locator|null>{for(let i=0;i<10;i++){const s=reactionSurface(page);if(await s.count().catch(()=>0))return s;await page.waitForTimeout(300);}return null;}
-async function freshProfiles(page:Page,before:Set<string>,max:number){const out:ReactionPerson[]=[];const emitted=new Set<string>();const anchors=profileAnchors(page);const n=Math.min(await anchors.count().catch(()=>0),2500);for(let i=0;i<n&&out.length<max;i++){const a=anchors.nth(i);if(!(await a.isVisible().catch(()=>false)))continue;const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");const name=clean((await a.textContent().catch(()=>""))||(await a.getAttribute("aria-label").catch(()=>"")));const key=href.toLowerCase();if(!href||!name||generic(name)||before.has(key)||emitted.has(key))continue;const context=await a.locator("xpath=ancestor::*[self::li or self::div][1]").innerText().catch(()=>"");if(/comment|reply/i.test(context)&&!/reaction|react|people who/i.test(context))continue;emitted.add(key);out.push({profileUrl:href,name,type:"REACTION",reactionType:"UNKNOWN"});}return out;}
+async function freshProfiles(page:Page,before:Set<string>,max:number){
+  // Disabled intentionally: reactions must be read from the reaction dialog only.
+  return [];
+}
 async function extractSurface(surface:Locator,seen:Set<string>,max:number){const out:ReactionPerson[]=[];const anchors=profileAnchors(surface);const n=Math.min(await anchors.count().catch(()=>0),1000);for(let i=0;i<n&&out.length<max;i++){const a=anchors.nth(i);if(!(await a.isVisible().catch(()=>false)))continue;const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");const name=clean((await a.textContent().catch(()=>""))||(await a.getAttribute("aria-label").catch(()=>"")));if(!href||!name||generic(name)||seen.has(href.toLowerCase()))continue;seen.add(href.toLowerCase());out.push({profileUrl:href,name,type:"REACTION",reactionType:"UNKNOWN"});}return out;}
-export async function scrapeReactions(postUrl:string,max=500):Promise<{reactions:ReactionPerson[];warnings:string[]}>{const warnings:string[]=[];const {browser,page}=await connectPage();try{await page.goto(postUrl,{waitUntil:"domcontentloaded",timeout:30000});await page.waitForTimeout(1800);const trigger=await findTrigger(page,postUrl);if(!trigger)return{reactions:[],warnings:["Could not locate the reaction interaction control inside the LinkedIn post."]};const before=await snapshotProfiles(page);console.log("Reaction interaction control found by post-scoped detection; capturing profile snapshot and clicking it.");await trigger.scrollIntoViewIfNeeded().catch(()=>{});await trigger.click({timeout:5000}).catch(async()=>trigger.click({timeout:5000,force:true}));await page.waitForTimeout(900);const reactions:ReactionPerson[]=[];const emitted=new Set<string>();for(let round=0;round<25&&reactions.length<max;round++){const fresh=await freshProfiles(page,before,max-reactions.length);for(const item of fresh){const key=item.profileUrl.toLowerCase();if(!emitted.has(key)){emitted.add(key);reactions.push(item);}}const surface=await waitReactionSurface(page);if(surface){const found=await extractSurface(surface,emitted,max-reactions.length);reactions.push(...found);await surface.focus().catch(()=>{});await surface.press("PageDown").catch(()=>{});}await page.waitForTimeout(450);if(!fresh.length&&!surface)break;}if(!reactions.length){warnings.push("Reaction interaction opened, but no new public LinkedIn profile URLs were exposed.");}console.log(`Reaction extraction enriched records: ${reactions.length}`);return{reactions,warnings};}finally{await page.close().catch(()=>{});await browser.close().catch(()=>{});}}
+export async function scrapeReactions(postUrl:string,max=500):Promise<{reactions:ReactionPerson[];warnings:string[]}>{
+  const warnings:string[]=[];
+  const {browser,page}=await connectPage();
+  try{
+    await page.goto(postUrl,{waitUntil:"domcontentloaded",timeout:30000});
+    await page.waitForTimeout(1800);
+    const trigger=await findTrigger(page,postUrl);
+    if(!trigger)return{reactions:[],warnings:["Could not locate the reaction interaction control inside the LinkedIn post."]};
+    console.log("Reaction DOM version: exact div[role=dialog] profile extraction v1");
+    await trigger.scrollIntoViewIfNeeded().catch(()=>{});
+    await trigger.click({timeout:5000}).catch(async()=>trigger.click({timeout:5000,force:true}));
+    await page.waitForTimeout(900);
+    const reactions:ReactionPerson[]=[];
+    const seen=new Set<string>();
+    for(let round=0;round<30&&reactions.length<max;round++){
+      const dialogs=page.locator('div[role="dialog"]');
+      const dn=Math.min(await dialogs.count().catch(()=>0),20);
+      let surface:Locator|null=null;
+      for(let i=dn-1;i>=0;i--){
+        const d=dialogs.nth(i);
+        if(!(await d.isVisible().catch(()=>false)))continue;
+        const anchors=d.locator('a[href*="/in/"]');
+        const text=clean(await d.innerText().catch(()=> ""));
+        if((await anchors.count().catch(()=>0))>0||/people who reacted|reactions?|likes?/i.test(text)){surface=d;break;}
+      }
+      if(!surface){await page.waitForTimeout(350);continue;}
+      const found=await extractSurface(surface,seen,max-reactions.length);
+      for(const item of found)reactions.push(item);
+      const more=surface.locator("button,[role='button'],a").filter({hasText:/load more|show more|more reactions|see more/i}).first();
+      const hasMore=await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false);
+      if(hasMore){await more.click({timeout:3000}).catch(()=>{});await page.waitForTimeout(650);}
+      else{await surface.mouse.wheel(0,1200).catch(()=>{});await page.waitForTimeout(450);}
+      if(!found.length&&!hasMore)break;
+    }
+    if(!reactions.length)warnings.push("Reaction dialog opened, but no public LinkedIn profile URLs were found inside div[role=dialog].");
+    console.log("Reaction DOM diagnostics: dialog profile anchors captured="+reactions.length);
+    return{reactions,warnings};
+  }finally{
+    await page.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+  }
+}
