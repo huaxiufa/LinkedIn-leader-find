@@ -113,29 +113,29 @@ async function extractComments(page:Page,max:number,postUrl:string){
   return out;
 }
 async function findPostReactionControl(page:Page,postUrl:string):Promise<Locator|null>{
-  const id=postUrl.match(/(?:ugcPost-|activity-)(\d+)/i)?.[1]??"";
-  const candidates=id?page.locator('[data-urn*="'+id+'"],[data-id*="'+id+'"]'):page.locator("article");
-  const n=Math.min(await candidates.count().catch(()=>0),20);
+  // LinkedIn does not reliably expose the post id in data-urn/data-id. The
+  // stable rendered signal is the post-level reaction count such as
+  // "3 reactions" / "3 likes". Scan visible UI text/ARIA and climb to the
+  // nearest clickable element. Reject comment-level reaction controls.
+  const all=page.locator("button,a,[role='button'],span,div");
+  const n=Math.min(await all.count().catch(()=>0),3500);
+  const countRe=/^\s*\d[\d,.]*\s+(?:reactions?|likes?)\s*$/i;
+  let fallback:Locator|null=null;
   for(let i=0;i<n;i++){
-    const node=candidates.nth(i);
-    if(!(await node.isVisible().catch(()=>false))) continue;
-    const root=node.locator("xpath=self::article | ancestor::article[1]");
-    const post=await root.count().catch(()=>0)?root.first():node;
-    const controls=post.locator("button,a,[role='button']");
-    const m=Math.min(await controls.count().catch(()=>0),1200);
-    let fallback:Locator|null=null;
-    for(let j=0;j<m;j++){
-      const x=controls.nth(j);
-      if(!(await x.isVisible().catch(()=>false))) continue;
-      const text=clean(await x.innerText().catch(()=>""));
-      const aria=clean(await x.getAttribute("aria-label").catch(()=>""));
-      const title=clean(await x.getAttribute("title").catch(()=>""));
-      const s=text+" "+aria+" "+title;
-      if(/\b\d[\d,.]*\s+(?:reactions?|likes?)\b/i.test(s)) return x;
-      if(/(?:view|open|see).*?(?:reactions?|likes?)/i.test(s) && !/reply|comment reaction|reaction button state/i.test(s)) fallback=x;
+    const x=all.nth(i);
+    if(!(await x.isVisible().catch(()=>false))) continue;
+    const text=clean(await x.innerText().catch(()=>""));
+    const aria=clean(await x.getAttribute("aria-label").catch(()=>""));
+    const title=clean(await x.getAttribute("title").catch(()=>""));
+    const s=text+" "+aria+" "+title;
+    if(/reaction button state|comment reaction|^reply$/i.test(s)) continue;
+    if(countRe.test(text)||countRe.test(aria)||countRe.test(title)){
+      const clickable=await nearestClickable(x);
+      if(await clickable.isVisible().catch(()=>false)) return clickable;
     }
-    if(fallback) return fallback;
+    if(/(?:view|open|see).*?(?:reactions?|likes?)/i.test(s) && !/comment|reply/i.test(s)) fallback=await nearestClickable(x);
   }
+  if(fallback && await fallback.isVisible().catch(()=>false)) return fallback;
   return null;
 }
 async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){
