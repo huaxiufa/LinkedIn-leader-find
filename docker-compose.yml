@@ -25,10 +25,6 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/linkedin_leads?schema=public
-      SCRAPER_POLL_MS: "3000"
-      SCRAPER_HEADLESS: "false"
-      SCRAPER_MAX_COMMENTS: "500"
-      SCRAPER_MAX_REACTIONS: "500"
       LINKEDIN_CDP_URL: http://host.docker.internal:9222
     ports:
       - "3000:3000"
@@ -46,8 +42,6 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/linkedin_leads?schema=public
       SCRAPER_POLL_MS: "3000"
-      SCRAPER_MAX_COMMENTS: "500"
-      SCRAPER_MAX_REACTIONS: "500"
       LINKEDIN_CDP_URL: http://host.docker.internal:9222
     depends_on:
       postgres:
