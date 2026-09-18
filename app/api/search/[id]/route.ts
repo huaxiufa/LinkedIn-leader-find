@@ -25,8 +25,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   }));
 
   const uniquePeople = new Set(search.engagements.map((e) => e.profileId)).size;
-  const matchedPeople = new Set(search.engagements.map((e) => e.profileId)).size;
-
   return NextResponse.json({
     id: search.id,
     postUrl: search.postUrl,
@@ -40,7 +38,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     maxEngagersPerPost: search.maxEngagersPerPost,
     totalEngagements: search.engagements.length,
     uniquePeople,
-    matchedPeople,
     results,
   });
 }
