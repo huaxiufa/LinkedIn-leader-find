@@ -19,17 +19,70 @@ async function clickControl(page:Page,c:Locator,label:string){console.log(`${lab
 async function climbComment(anchor:Locator){
   let node=anchor;
   for(let i=0;i<40;i++){
-    const text=clean(await node.textContent().catch(()=>""));
-    const cls=clean(`${await node.getAttribute("class").catch(()=>"")} ${await node.getAttribute("data-view-name").catch(()=>"")} ${await node.getAttribute("data-test-id").catch(()=>"")}`);
+    const text=clean(await node.textContent().catch(()=> ""));
+    const cls=clean((await node.getAttribute("class").catch(()=> ""))+" "+(await node.getAttribute("data-view-name").catch(()=> ""))+" "+(await node.getAttribute("data-test-id").catch(()=> "")));
     const hasReply=await node.locator("button,[role='button'],a").filter({hasText:/^reply$/i}).count().catch(()=>0);
-    if(hasReply && text.length<15000 && /\\breply\\b/i.test(text)) return node;
-    if(/(^|\\s)comment(?!ary)/i.test(cls) && text.length<15000 && /\\breply\\b/i.test(text)) return node;
+    if(hasReply && text.length<15000 && /\breply\b/i.test(text)) return node;
+    if(/(^|[\s_-])comment(?!ary)/i.test(cls) && text.length<15000 && /\breply\b/i.test(text)) return node;
     const p=node.locator("xpath=..");
     if(!(await p.count().catch(()=>0))) break;
     node=p;
   }
   return null;
 }
-async function extractComments(page:Page,max:number,postUrl:string){const c=await controls(page,"comments",postUrl);if(c)await clickControl(page,c,"Comment interaction");else console.log("Comment count control not found; scanning current comment UI only.");const root=commentSurface(page);const scope=await root.count().catch(()=>0)?root:page.locator("main").first();const anchors=profileAnchors(scope);const n=Math.min(await anchors.count().catch(()=>0),Math.max(max*12,150));const out:ScrapedEngagement[]=[];const seen=new Set<string>();const rejected:string[]=[];for(let i=0;i<n&&out.length<max;i++){const a=anchors.nth(i);if(!(await a.isVisible().catch(()=>false)))continue;const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");const name=clean((await a.textContent().catch(()=>""))||(await a.getAttribute("aria-label").catch(()=>"")));const key=href.toLowerCase();if(!href||!name||generic(name)||seen.has(key))continue;const box=await climbComment(a);if(!box){if(rejected.length<12)rejected.push(`${name} => ${href}`);continue;}const txt=clean(await box.textContent().catch(()=>""));const lines=txt.split(/\n+/).map(clean).filter(Boolean);const idx=lines.findIndex(x=>x.toLowerCase()===name.toLowerCase());const body=idx>=0?lines.slice(idx+1).filter(x=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(x)).join(" ").slice(0,5000):"";seen.add(key);out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});}console.log(`Comment diagnostics: anchors=${n}, captured=${out.length}, rejected=${rejected.join(" || ")||"none"}`);return out;}
+async function extractComments(page:Page,max:number,postUrl:string){
+  const c=await controls(page,"comments",postUrl);
+  if(c)await clickControl(page,c,"Comment interaction");else console.log("Comment count control not found; scanning current comment UI only.");
+  await page.waitForTimeout(500);
+  const selectors=[
+    "[class*='comments-comment-item']",
+    "[class*='feed-shared-update-v2__comment-item']",
+    "[data-view-name*='comment']",
+    "[data-test-id*='comment']",
+    "article.comments-comment-item",
+    "li.comments-comment-item"
+  ];
+  const items=page.locator(selectors.join(","));
+  const itemCount=await items.count().catch(()=>0);
+  const out:ScrapedEngagement[]=[];const seen=new Set<string>();const rejected:string[]=[];
+  if(itemCount){
+    const n=Math.min(itemCount,Math.max(max*4,50));
+    for(let i=0;i<n&&out.length<max;i++){
+      const item=items.nth(i);if(!(await item.isVisible().catch(()=>false)))continue;
+      const anchors=profileAnchors(item);const an=Math.min(await anchors.count().catch(()=>0),6);
+      for(let j=0;j<an&&out.length<max;j++){
+        const x=anchors.nth(j);if(!(await x.isVisible().catch(()=>false)))continue;
+        const href=profile((await x.getAttribute("href").catch(()=> ""))||(await x.getAttribute("data-profile-url").catch(()=> ""))||(await x.getAttribute("data-test-profile-url").catch(()=> ""))||"");
+        const rawName=clean((await x.textContent().catch(()=> ""))||(await x.getAttribute("aria-label").catch(()=> "")));
+        const name=rawName.split(/•|\n/)[0].trim();const key=href.toLowerCase();
+        if(!href||!name||generic(name)||seen.has(key))continue;
+        const txt=clean(await item.textContent().catch(()=> ""));
+        if(!/\breply\b|\blike\b|\btranslate\b/i.test(txt)){if(rejected.length<12)rejected.push(name+" => no-comment-controls");continue;}
+        const lines=txt.split(/\n+/).map(clean).filter(Boolean);
+        const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
+        const body=idx>=0?lines.slice(idx+1).filter(v=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(v)).join(" ").slice(0,5000):"";
+        seen.add(key);out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});break;
+      }
+    }
+  }
+  if(!out.length){
+    const root=commentSurface(page);const scope=await root.count().catch(()=>0)?root:page.locator("main").first();
+    const anchors=profileAnchors(scope);const an=Math.min(await anchors.count().catch(()=>0),Math.max(max*12,150));
+    for(let i=0;i<an&&out.length<max;i++){
+      const x=anchors.nth(i);if(!(await x.isVisible().catch(()=>false)))continue;
+      const href=profile((await x.getAttribute("href").catch(()=> ""))||(await x.getAttribute("data-profile-url").catch(()=> ""))||(await x.getAttribute("data-test-profile-url").catch(()=> ""))||"");
+      const rawName=clean((await x.textContent().catch(()=> ""))||(await x.getAttribute("aria-label").catch(()=> "")));
+      const name=rawName.split(/•|\n/)[0].trim();const key=href.toLowerCase();
+      if(!href||!name||generic(name)||seen.has(key))continue;
+      const box=await climbComment(x);if(!box){if(rejected.length<12)rejected.push(name+" => "+href);continue;}
+      const txt=clean(await box.textContent().catch(()=> ""));if(txt.length>15000)continue;
+      const lines=txt.split(/\n+/).map(clean).filter(Boolean);const idx=lines.findIndex(v=>v.toLowerCase().includes(name.toLowerCase()));
+      const body=idx>=0?lines.slice(idx+1).filter(v=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(v)).join(" ").slice(0,5000):"";
+      seen.add(key);out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});
+    }
+  }
+  console.log("Comment diagnostics: itemContainers="+itemCount+", captured="+out.length+", rejected="+(rejected.join(" || ")||"none"));
+  return out;
+}
 async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){const c=await controls(page,"reactions",postUrl);if(!c){warnings.push("Could not locate the reaction interaction control inside the LinkedIn post.");return [];}const before=await snapshotProfileVisibility(page);await clickControl(page,c,"Reaction interaction");const reactions:ScrapedEngagement[]=[];const emitted=new Set<string>();for(let r=0;r<24&&reactions.length<max;r++){const anchors=profileAnchors(page);const n=Math.min(await anchors.count().catch(()=>0),2500);let found=0;for(let i=0;i<n&&reactions.length<max;i++){const a=anchors.nth(i);if(!(await a.isVisible().catch(()=>false)))continue;const href=profile((await a.getAttribute("href").catch(()=>""))||(await a.getAttribute("data-profile-url").catch(()=>""))||(await a.getAttribute("data-test-profile-url").catch(()=>""))||"");const name=clean((await a.textContent().catch(()=>""))||(await a.getAttribute("aria-label").catch(()=>"")));const key=href.toLowerCase();if(!href||!name||generic(name)||emitted.has(key))continue;const beforeVisible=before.get(key)===true;const surface=await reactionSurfaceAfterClick(page);const inSurface=surface?await a.locator("xpath=ancestor-or-self::*").filter({has:surface}).count().catch(()=>0):0;if(beforeVisible&&!inSurface)continue;const context=clean(await a.locator("xpath=ancestor::*[self::li or self::div or self::article][1]").textContent().catch(()=>""));if(!inSurface&&/comment|reply/i.test(context)&&!/reaction|react|people who/i.test(context))continue;emitted.add(key);reactions.push({profileUrl:href,name,type:"REACTION",reactionType:"UNKNOWN"});found++;}const surface=await reactionSurfaceAfterClick(page);if(surface){await surface.focus().catch(()=>{});await surface.press("PageDown").catch(()=>{});}await page.waitForTimeout(500);if(!found&&!surface)break;}if(!reactions.length){warnings.push("Reaction interaction opened, but no reaction profiles could be identified without using unrelated page-wide profiles.");}console.log(`Reaction extraction: ${reactions.length} profile(s) captured.`);return reactions;}
 export async function scrapePublicPost(postUrl:string,options:{maxComments?:number;maxReactions?:number}={}):Promise<ScrapeResult>{const maxComments=options.maxComments??500,maxReactions=options.maxReactions??500,warnings:string[]=[];const {browser,page}=await connect();try{await page.goto(postUrl,{waitUntil:"domcontentloaded",timeout:30000});await page.waitForTimeout(2000);const signedOut=await page.locator('input[name="session_key"],form[action*="login"]').count().catch(()=>0);console.log(`LinkedIn session: ${signedOut?"SIGNED OUT":"SIGNED IN"}`);if(signedOut)warnings.push("LinkedIn appears to be signed out in the connected Chrome profile.");const comments=await extractComments(page,maxComments,postUrl);const reactions=await extractReactions(page,maxReactions,postUrl,warnings);const merged=new Map<string,ScrapedEngagement>();for(const item of [...reactions,...comments]){const key=normalizeLinkedInUrl(item.profileUrl).toLowerCase();if(!key)continue;const old=merged.get(key);if(!old||item.type==="COMMENT")merged.set(key,item);}console.log(`Engagement merge: comments=${comments.length}, reactions=${reactions.length}, unique=${merged.size}.`);return{engagements:[...merged.values()],warnings};}finally{await page.close().catch(()=>{});await browser.close().catch(()=>{});}}
