@@ -49,7 +49,7 @@ export async function scrapeReactions(postUrl:string,max=500):Promise<{reactions
       const more=surface.locator("button,[role='button'],a").filter({hasText:/load more|show more|more reactions|see more/i}).first();
       const hasMore=await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false);
       if(hasMore){await more.click({timeout:3000}).catch(()=>{});await page.waitForTimeout(650);}
-      else{await surface.mouse.wheel(0,1200).catch(()=>{});await page.waitForTimeout(450);}
+      else{await surface.focus().catch(()=>{});await surface.press("PageDown").catch(()=>{});await page.waitForTimeout(450);}
       if(!found.length&&!hasMore)break;
     }
     if(!reactions.length)warnings.push("Reaction dialog opened, but no public LinkedIn profile URLs were found inside div[role=dialog].");
