@@ -36,62 +36,80 @@ async function extractComments(page:Page,max:number,postUrl:string){
   if(c) await clickControl(page,c,"Comment interaction");
   else console.log("Comment count control not found; scanning current comment UI only.");
 
-  // Load the comment section before reading it. LinkedIn uses lazy loading.
-  for(let pass=0;pass<12;pass++){
+  // LinkedIn's current DOM can omit the legacy .comments-comment-item class.
+  // Each real comment still exposes a stable semantic marker on its options
+  // button: aria-label="View more options for <name>'s comment."
+  // We anchor extraction on that marker instead of scanning every /in/ link.
+  for(let pass=0;pass<15;pass++){
     const more=page.locator("button,[role='button'],a").filter({hasText:/load more comments?|more comments?|show more comments?/i}).first();
-    if(await more.count().catch(()=>0) && await more.isVisible().catch(()=>false)){
+    if(await more.count().catch(()=>0)&&await more.isVisible().catch(()=>false)){
       await more.click({timeout:3000}).catch(()=>{});
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(500);
     }
-    await page.mouse.wheel(0,1200).catch(()=>{});
-    await page.waitForTimeout(350);
+    await page.mouse.wheel(0,1000).catch(()=>{});
+    await page.waitForTimeout(300);
   }
 
-  // Authoritative DOM path: LinkedIn comment items themselves.
-  // Do NOT fall back to arbitrary /in/ links on the page, because those include
-  // the post author, company links, hover cards, etc.
-  const items=page.locator(".comments-comment-item");
-  const itemCount=await items.count().catch(()=>0);
+  const markers=page.locator('button[aria-label*="comment" i]');
+  const markerCount=Math.min(await markers.count().catch(()=>0),1000);
   const out:ScrapedEngagement[]=[];
   const seen=new Set<string>();
 
-  for(let i=0;i<itemCount && out.length<max;i++){
-    const item=items.nth(i);
-    if(!(await item.isVisible().catch(()=>false))) continue;
+  for(let i=0;i<markerCount&&out.length<max;i++){
+    const marker=markers.nth(i);
+    if(!(await marker.isVisible().catch(()=>false))) continue;
+    const label=clean(await marker.getAttribute("aria-label").catch(()=> ""));
+    if(!/comment/i.test(label)) continue;
 
-    const anchors=item.locator('a[href*="/in/"]');
-    const an=Math.min(await anchors.count().catch(()=>0),8);
-    if(!an) continue;
-
+    let node=marker;
     let chosen:Locator|null=null;
-    let chosenHref="";
-    let chosenName="";
-    for(let j=0;j<an;j++){
-      const a=anchors.nth(j);
-      if(!(await a.isVisible().catch(()=>false))) continue;
-      const href=profile(await a.getAttribute("href").catch(()=> ""));
-      const rawName=clean((await a.innerText().catch(()=> ""))||(await a.getAttribute("aria-label").catch(()=> "")));
-      const name=rawName.split(/•|\\n/)[0].trim();
-      if(!href||!name||generic(name)||seen.has(href.toLowerCase())) continue;
-      chosen=a;chosenHref=href;chosenName=name;break;
+    for(let level=0;level<28;level++){
+      const anchors=node.locator('a[href*="/in/"]');
+      const n=Math.min(await anchors.count().catch(()=>0),8);
+      if(n>0){
+        const expandable=node.locator('[data-testid="expandable-text-box"]');
+        const reply=node.locator('button[aria-label="Reply"],button,[role="button"]').filter({hasText:/^reply$/i});
+        const txt=clean(await node.innerText().catch(()=> ""));
+        if((await expandable.count().catch(()=>0))>0 || (await reply.count().catch(()=>0))>0 || /View more options for .+comment/i.test(label)){
+          chosen=node;
+          break;
+        }
+      }
+      const parent=node.locator("xpath=..");
+      if(!(await parent.count().catch(()=>0))) break;
+      node=parent;
     }
     if(!chosen) continue;
 
-    const txt=clean(await item.innerText().catch(()=> ""));
-    const lines=txt.split(/\n+/).map(clean).filter(Boolean);
-    const lower=lines.map(x=>x.toLowerCase());
-    const idx=lower.findIndex(x=>x.includes(chosenName.toLowerCase()));
-    const body=idx>=0
-      ?lines.slice(idx+1).filter(x=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(x)).join(" ").slice(0,5000)
-      :"";
+    const anchors=chosen.locator('a[href*="/in/"]');
+    const n=Math.min(await anchors.count().catch(()=>0),8);
+    let href="",name="";
+    for(let j=0;j<n;j++){
+      const a=anchors.nth(j);
+      if(!(await a.isVisible().catch(()=>false))) continue;
+      const h=profile(await a.getAttribute("href").catch(()=> ""));
+      const raw=clean((await a.innerText().catch(()=> ""))||(await a.getAttribute("aria-label").catch(()=> "")));
+      const nm=raw.split(/•|\\n/)[0].trim();
+      if(h&&nm&&!generic(nm)&&!seen.has(h.toLowerCase())){href=h;name=nm;break;}
+    }
+    if(!href||!name) continue;
 
-    const key=chosenHref.toLowerCase();
-    seen.add(key);
-    out.push({profileUrl:chosenHref,name:chosenName,type:"COMMENT",commentText:body||undefined});
+    const bodyNodes=chosen.locator('[data-testid="expandable-text-box"]');
+    let body="";
+    if(await bodyNodes.count().catch(()=>0)){
+      body=clean(await bodyNodes.first().innerText().catch(()=> ""));
+    }else{
+      const lines=clean(await chosen.innerText().catch(()=> "")).split(/\n+/).map(clean).filter(Boolean);
+      const idx=lines.findIndex(x=>x.toLowerCase().includes(name.toLowerCase()));
+      body=idx>=0?lines.slice(idx+1).filter(x=>!/^(like|reply|follow|edited|see more|see less|translate)$/i.test(x)).join(" ").slice(0,5000):"";
+    }
+
+    seen.add(href.toLowerCase());
+    out.push({profileUrl:href,name,type:"COMMENT",commentText:body||undefined});
   }
 
-  console.log("Comment DOM diagnostics: .comments-comment-item="+itemCount+", captured="+out.length);
-  if(!itemCount) console.log("Comment DOM diagnostics: no .comments-comment-item nodes found after loading; no page-wide profile fallback will be used.");
+  console.log("Comment DOM diagnostics: semantic comment markers="+markerCount+", captured="+out.length);
+  if(!markerCount) console.log("Comment DOM diagnostics: no button[aria-label*=comment] markers found.");
   return out;
 }
 async function extractReactions(page:Page,max:number,postUrl:string,warnings:string[]){
